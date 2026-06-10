@@ -1,0 +1,16 @@
+# Build output
+build/
+
+# Object files / archives / deps
+*.o
+*.a
+*.d
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local settings
+.claude/
