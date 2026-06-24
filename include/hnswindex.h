@@ -26,6 +26,11 @@ class HNSWIndex {
         std::vector<InternalId> search(const float* query, size_t K, size_t ef) const;
         const float* get(InternalId) const;
 
+        // Tombstone a node: it is excluded from search *results* but still traversed
+        // through during graph descent, so connectivity is preserved. See Node::deleted.
+        void mark_deleted(InternalId id);
+        bool is_deleted(InternalId id) const;
+
         size_t size() const { return node_pool_.size(); }
         size_t dim()  const { return config_.dim; }
 
@@ -33,6 +38,7 @@ class HNSWIndex {
         struct Node {
             std::vector<float> data;
             std::vector<std::vector<InternalId>> neighbours;
+            bool deleted = false;  // tombstone flag (see mark_deleted)
             Node(const float* vec, size_t dim, int max_layer, size_t M, size_t Mmax0);
         };
 

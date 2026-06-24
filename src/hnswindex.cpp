@@ -45,6 +45,14 @@ const float* HNSWIndex::get(InternalId id) const {
     return node_pool_[id].data.data();
 }
 
+void HNSWIndex::mark_deleted(InternalId id) {
+    node_pool_[id].deleted = true;
+}
+
+bool HNSWIndex::is_deleted(InternalId id) const {
+    return node_pool_[id].deleted;
+}
+
 std::vector<InternalId> HNSWIndex::search_layer(const float* q,
                                                 const std::vector<InternalId>& eps,
                                                 size_t ef, int layer) const {
@@ -210,7 +218,18 @@ std::vector<InternalId> HNSWIndex::search(const float* query, size_t K, size_t e
         if (!W.empty()) eps = {W.front()};
     }
 
+    // Collect ef >= K candidates ordered closest-first, then drop tombstoned nodes
+    // and keep the K nearest survivors. Crucially, the traversal above descended
+    // *through* deleted nodes — only the final result set excludes them. The ef
+    // buffer is what lets us still return K live results when some are tombstoned.
     auto W = search_layer(query, eps, std::max(ef, K), 0);
-    if (W.size() > K) W.resize(K);
-    return W;
+
+    std::vector<InternalId> result;
+    result.reserve(std::min(W.size(), K));
+    for (InternalId id : W) {
+        if (node_pool_[id].deleted) continue;
+        result.push_back(id);
+        if (result.size() == K) break;
+    }
+    return result;
 }
