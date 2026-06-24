@@ -64,10 +64,14 @@ std::vector<uint32_t> brute_topk(const std::vector<std::vector<float>>& data,
     return out;
 }
 
-int recall(const std::vector<InternalId>& got, const std::vector<uint32_t>& truth) {
+// `got` are ExternalIds from the DB; `truth` are indices into `data`. `ids[i]` is the
+// ExternalId that data row i was inserted under, so we compare in ExternalId space
+// rather than assuming any fixed relationship between the two id kinds.
+int recall(const std::vector<ExternalId>& got, const std::vector<uint32_t>& truth,
+           const std::vector<ExternalId>& ids) {
     int hits = 0;
     for (auto g : got) {
-        for (auto t : truth) if ((uint32_t)g == t) { ++hits; break; }
+        for (auto t : truth) if (g == ids[t]) { ++hits; break; }
     }
     return hits;
 }
@@ -97,8 +101,10 @@ Result run_one(size_t N, size_t dim, size_t K, size_t ef_search, size_t n_querie
     cfg.hnsw.ef   = 200;  // efConstruction
     VDB db(cfg);
 
+    std::vector<ExternalId> ids;
+    ids.reserve(data.size());
     auto t0 = clk::now();
-    for (const auto& v : data) db.insert(v.data());
+    for (const auto& v : data) ids.push_back(db.insert(v.data()));
     auto t1 = clk::now();
     double build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -121,7 +127,7 @@ Result run_one(size_t N, size_t dim, size_t K, size_t ef_search, size_t n_querie
     auto th0 = clk::now();
     for (size_t q = 0; q < n_queries; ++q) {
         auto got = db.search(queries[q].data(), K, ef_search);
-        total_hits += recall(got, truths[q]);
+        total_hits += recall(got, truths[q], ids);
     }
     auto th1 = clk::now();
     double hnsw_us =
