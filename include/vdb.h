@@ -1,8 +1,11 @@
 #pragma once
 
 #include <hnswindex.h>
+#include <wal.h>
 
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -14,6 +17,19 @@ struct VDBConfig {
     IndexType  type = IndexType::HNSW;
     HNSWConfig hnsw;          // used when type == HNSW
     DistanceFn dist_fn;       // optional; defaults to squared L2 if empty
+
+    // ---- Durability (Phase 2) ----
+    // data_dir empty  → pure in-memory database (Phase 1 behaviour, no disk I/O).
+    // data_dir set    → durable: a WAL + periodic snapshots live under this dir,
+    //                   and the constructor recovers prior state from them.
+    std::string      data_dir;
+    DurabilityPolicy durability        = DurabilityPolicy::Always;
+    uint32_t         fsync_interval_ms = 1000;  // used when durability == EveryMs
+    uint8_t          metric            = 0;      // 0 = L2; stamped into file headers
+
+    // Auto-checkpoint after this many mutating ops (0 = never auto-checkpoint;
+    // callers can still invoke VDB::checkpoint() explicitly).
+    uint64_t checkpoint_threshold_ops = 0;
 };
 
 // VDB is the database layer that owns the *logical identity* of every vector.
@@ -49,6 +65,14 @@ public:
     size_t size() const;   // number of live (non-deleted) vectors
     size_t dim()  const;
 
+    // Write a full snapshot and rotate (truncate) the WAL. No-op for an in-memory
+    // database. Callers rarely need this — it also runs automatically once
+    // checkpoint_threshold_ops mutating operations have accumulated.
+    void checkpoint();
+
+    // True when backed by a WAL + snapshots on disk.
+    bool durable() const { return durable_; }
+
 private:
     VDBConfig                                  config_;
     std::unique_ptr<HNSWIndex>                 hnsw_;
@@ -61,5 +85,27 @@ private:
     std::vector<ExternalId>                    int_to_ext_;
     ExternalId                                 next_ext_id_ = 1;
 
+    // ---- durability state (only meaningful when durable_) ----
+    std::unique_ptr<Wal> wal_;
+    bool                 durable_              = false;
+    uint64_t             current_lsn_          = 0;  // last durably-logged LSN
+    uint64_t             snapshot_seq_         = 0;  // id of the newest snapshot
+    uint64_t             ops_since_checkpoint_ = 0;
+
     void bind(InternalId internal, ExternalId ext);
+
+    // In-memory state transitions, shared by the live write path and WAL replay.
+    // They take an explicit ExternalId because replay must reconstruct the exact
+    // same identities that were logged — minting fresh ids would diverge from disk.
+    void do_insert(ExternalId ext, const float* vec);
+    void do_remove(ExternalId ext);
+    void do_update(ExternalId ext, const float* vec);
+    void apply(const WalRecord& rec);
+
+    // log-before-apply: append rec to the WAL (assigning the next LSN) and fsync
+    // per policy, BEFORE the matching do_* mutates memory. No-op when !durable_.
+    void log(WalRecordType type, ExternalId ext, const float* vec);
+
+    void recover();              // load snapshot + replay WAL on open
+    void maybe_auto_checkpoint();
 };
