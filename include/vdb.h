@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -40,6 +41,15 @@ struct VDBConfig {
 // exposes them. Instead it hands callers a stable ExternalId and keeps a two-way
 // map between the two. This layer of indirection is what makes delete, update, and
 // (later) compaction possible without invalidating references callers already hold.
+//
+// Thread safety (Phase 3.1 — single-writer / multi-reader isolation):
+//   Every public method is safe to call concurrently from multiple threads. A single
+//   reader/writer lock (mutex_) guards all shared state — the index, the id maps, and
+//   the durability bookkeeping. Const query methods (search/get/contains/size/dim)
+//   take a SHARED lock, so any number of them run in parallel. Mutating methods
+//   (insert/remove/update/checkpoint) take an EXCLUSIVE lock and run one at a time,
+//   blocking readers for their duration. This is the coarsest correct scheme: simple,
+//   deadlock-free, and the baseline the roadmap's finer-grained locking (3.2) builds on.
 class VDB {
 public:
     explicit VDB(VDBConfig cfg);
@@ -51,6 +61,13 @@ public:
     std::vector<ExternalId> search(const float* query, size_t K, size_t ef) const;
 
     // Pointer to the stored vector for `id`, or nullptr if `id` is absent/deleted.
+    //
+    // Thread-safety caveat: the returned pointer aliases storage inside the index and
+    // is only guaranteed valid until the next mutating call on this VDB. Under
+    // concurrent use a writer on another thread can reallocate that storage the moment
+    // get() returns, dangling the pointer. Callers sharing a VDB across threads must
+    // therefore copy what they need out of get() while no write can be in flight, or
+    // prefer search()/contains() (which return by value and are always safe).
     const float* get(ExternalId id) const;
 
     // Tombstone the vector behind `id`. Returns false if `id` is not present.
@@ -74,6 +91,13 @@ public:
     bool durable() const { return durable_; }
 
 private:
+    // Guards every field below and the HNSW index. Shared for reads, exclusive for
+    // writes. mutable so the const query methods can take a shared lock. Held by the
+    // public entry points only — the private do_*/log/apply helpers assume the caller
+    // already holds it (otherwise checkpoint() re-locking from maybe_auto_checkpoint()
+    // would self-deadlock; std::shared_mutex is not recursive).
+    mutable std::shared_mutex                  mutex_;
+
     VDBConfig                                  config_;
     std::unique_ptr<HNSWIndex>                 hnsw_;
 
@@ -108,4 +132,9 @@ private:
 
     void recover();              // load snapshot + replay WAL on open
     void maybe_auto_checkpoint();
+
+    // The actual checkpoint work, assuming mutex_ is already held exclusively. The
+    // public checkpoint() wraps this with the lock; maybe_auto_checkpoint() calls it
+    // directly from inside an already-locked mutation.
+    void do_checkpoint();
 };
