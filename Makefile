@@ -1,7 +1,7 @@
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
-# VDB is thread-safe (Phase 3) and the test suite spins up reader/writer threads,
-# so both the library and the test binary need the pthreads runtime.
+# pthreads is linked ahead of Stage 7 (concurrency), where the test suite will
+# spin up reader/writer threads. Harmless before then.
 CXXFLAGS += -pthread
 AR       ?= ar
 
