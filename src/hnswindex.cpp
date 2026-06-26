@@ -1,9 +1,12 @@
 #include <hnswindex.h>
 
+#include <serialize.h>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <queue>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
@@ -232,4 +235,77 @@ std::vector<InternalId> HNSWIndex::search(const float* query, size_t K, size_t e
         if (result.size() == K) break;
     }
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot serialization (Phase 2).
+//
+// Format (all host-endian; the snapshot file header upstream carries dim/metric):
+//   u64  node_count
+//   i64  max_layer        (-1 sentinel for an empty index)
+//   u32  entry_point
+//   per node:
+//     u8   deleted
+//     f32[dim] data
+//     u16  num_layers
+//     per layer: u32 count, InternalId[count] neighbours
+// ---------------------------------------------------------------------------
+
+void HNSWIndex::save(std::ostream& os) const {
+    ser::write_pod(os, static_cast<uint64_t>(node_pool_.size()));
+    ser::write_pod(os, static_cast<int64_t>(max_layer_));
+    ser::write_pod(os, static_cast<uint32_t>(entry_point_));
+
+    for (const Node& n : node_pool_) {
+        ser::write_pod(os, static_cast<uint8_t>(n.deleted ? 1 : 0));
+        os.write(reinterpret_cast<const char*>(n.data.data()),
+                 static_cast<std::streamsize>(config_.dim * sizeof(float)));
+
+        ser::write_pod(os, static_cast<uint16_t>(n.neighbours.size()));
+        for (const auto& layer : n.neighbours) {
+            ser::write_pod(os, static_cast<uint32_t>(layer.size()));
+            os.write(reinterpret_cast<const char*>(layer.data()),
+                     static_cast<std::streamsize>(layer.size() * sizeof(InternalId)));
+        }
+    }
+}
+
+void HNSWIndex::load(std::istream& is) {
+    uint64_t node_count = 0;
+    int64_t  max_layer  = -1;
+    uint32_t entry      = 0;
+    if (!ser::read_pod(is, node_count) || !ser::read_pod(is, max_layer) ||
+        !ser::read_pod(is, entry)) {
+        throw std::runtime_error("snapshot: truncated graph header");
+    }
+
+    node_pool_.clear();
+    node_pool_.resize(node_count);
+
+    for (uint64_t i = 0; i < node_count; ++i) {
+        Node& n = node_pool_[i];
+
+        uint8_t deleted = 0;
+        if (!ser::read_pod(is, deleted)) throw std::runtime_error("snapshot: truncated node");
+        n.deleted = (deleted != 0);
+
+        n.data.resize(config_.dim);
+        is.read(reinterpret_cast<char*>(n.data.data()),
+                static_cast<std::streamsize>(config_.dim * sizeof(float)));
+
+        uint16_t num_layers = 0;
+        if (!ser::read_pod(is, num_layers)) throw std::runtime_error("snapshot: truncated node");
+        n.neighbours.resize(num_layers);
+        for (uint16_t l = 0; l < num_layers; ++l) {
+            uint32_t count = 0;
+            if (!ser::read_pod(is, count)) throw std::runtime_error("snapshot: truncated node");
+            n.neighbours[l].resize(count);
+            is.read(reinterpret_cast<char*>(n.neighbours[l].data()),
+                    static_cast<std::streamsize>(count * sizeof(InternalId)));
+        }
+        if (!is) throw std::runtime_error("snapshot: truncated node body");
+    }
+
+    max_layer_   = static_cast<int>(max_layer);
+    entry_point_ = static_cast<InternalId>(entry);
 }

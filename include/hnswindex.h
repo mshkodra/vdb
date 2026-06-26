@@ -2,6 +2,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <istream>
+#include <ostream>
 #include <random>
 #include <vector>
 
@@ -34,11 +36,20 @@ class HNSWIndex {
         size_t size() const { return node_pool_.size(); }
         size_t dim()  const { return config_.dim; }
 
+        // Serialize / rebuild the raw graph (node vectors, per-layer neighbour
+        // lists, tombstone flags, entry point, max layer) to/from a byte stream.
+        // This is pure topology + payload — it knows nothing about ExternalIds.
+        // Identity (the ext<->int maps) is persisted one layer up, in VDB. See
+        // the Phase 2 doc on why the split is preserved through snapshots.
+        void save(std::ostream& os) const;
+        void load(std::istream& is);
+
     private:
         struct Node {
             std::vector<float> data;
             std::vector<std::vector<InternalId>> neighbours;
             bool deleted = false;  // tombstone flag (see mark_deleted)
+            Node() = default;      // used by load()
             Node(const float* vec, size_t dim, int max_layer, size_t M, size_t Mmax0);
         };
 
