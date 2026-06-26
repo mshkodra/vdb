@@ -1,5 +1,8 @@
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
+# pthreads is linked ahead of Stage 7 (concurrency), where the test suite will
+# spin up reader/writer threads. Harmless before then.
+CXXFLAGS += -pthread
 AR       ?= ar
 
 INCLUDE   := -Iinclude
