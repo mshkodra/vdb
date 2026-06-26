@@ -3,6 +3,8 @@
 #include <snapshot.h>
 
 #include <filesystem>
+#include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 namespace fs = std::filesystem;
@@ -146,6 +148,7 @@ void VDB::recover() {
 // ---------------------------------------------------------------------------
 
 ExternalId VDB::insert(const float* vec) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     const ExternalId ext = next_ext_id_;  // peek; do_insert advances the minter
     log(WalRecordType::Insert, ext, vec);
     do_insert(ext, vec);
@@ -154,6 +157,7 @@ ExternalId VDB::insert(const float* vec) {
 }
 
 bool VDB::remove(ExternalId id) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (ext_to_int_.find(id) == ext_to_int_.end()) return false;  // unknown → don't log
     log(WalRecordType::Delete, id, nullptr);
     do_remove(id);
@@ -162,6 +166,7 @@ bool VDB::remove(ExternalId id) {
 }
 
 bool VDB::update(ExternalId id, const float* vec) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (ext_to_int_.find(id) == ext_to_int_.end()) return false;
     log(WalRecordType::Update, id, vec);
     do_update(id, vec);
@@ -170,6 +175,7 @@ bool VDB::update(ExternalId id, const float* vec) {
 }
 
 std::vector<ExternalId> VDB::search(const float* query, size_t K, size_t ef) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     // The index already excludes tombstoned nodes from results, so every InternalId
     // it returns has a valid, live mapping in int_to_ext_.
     const auto internal = hnsw_->search(query, K, ef);
@@ -181,12 +187,18 @@ std::vector<ExternalId> VDB::search(const float* query, size_t K, size_t ef) con
 }
 
 const float* VDB::get(ExternalId id) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     const auto it = ext_to_int_.find(id);
     if (it == ext_to_int_.end()) return nullptr;  // absent or already deleted
     return hnsw_->get(it->second);
 }
 
 void VDB::checkpoint() {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    do_checkpoint();
+}
+
+void VDB::do_checkpoint() {
     if (!durable_) return;
 
     snapshot_seq_++;
@@ -207,10 +219,23 @@ void VDB::checkpoint() {
 }
 
 void VDB::maybe_auto_checkpoint() {
+    // Called from inside a mutation that already holds mutex_ exclusively, so this
+    // invokes do_checkpoint() directly rather than the locking checkpoint().
     if (!durable_ || config_.checkpoint_threshold_ops == 0) return;
-    if (++ops_since_checkpoint_ >= config_.checkpoint_threshold_ops) checkpoint();
+    if (++ops_since_checkpoint_ >= config_.checkpoint_threshold_ops) do_checkpoint();
 }
 
-bool   VDB::contains(ExternalId id) const { return ext_to_int_.count(id) != 0; }
-size_t VDB::size() const { return ext_to_int_.size(); }
-size_t VDB::dim()  const { return hnsw_->dim(); }
+bool VDB::contains(ExternalId id) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return ext_to_int_.count(id) != 0;
+}
+
+size_t VDB::size() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return ext_to_int_.size();
+}
+
+size_t VDB::dim() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return hnsw_->dim();
+}
