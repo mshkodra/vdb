@@ -15,6 +15,7 @@ build/
 
 # Claude Code local settings
 .claude/
+CLAUDE.md
 
 # Docs (kept local)
 docs/
