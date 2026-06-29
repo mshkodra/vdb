@@ -29,6 +29,9 @@ public:
     InternalId add(const float* vec) override;
     std::vector<std::pair<InternalId, float>> search(const float* query,
                                                      size_t K) const override;
+
+    // nprobe is a search-time recall/speed dial; no retrain needed to change it.
+    void set_nprobe(size_t np) { config_.nprobe = np; }
     size_t size() const override;
     size_t dim() const override;
 
@@ -42,7 +45,8 @@ private:
     std::vector<std::vector<InternalId>>        inverted_lists_; // nlist lists
     std::vector<std::vector<float>>             vectors_;        // raw storage
 
-    // int nearest_centroid(const float* v) const;
+    // Argmin over centroids_ for a single vector (reused by train + add).
+    int nearest_centroid(const float* v) const;
 };
 
 }  // namespace vdb
