@@ -49,9 +49,29 @@ private:
 
     std::vector<Node> nodes_;  // TODO Stage 3
 
-    // int sample_layer() const;
-    // std::vector<InternalId> search_layer(...) const;
-    // std::vector<InternalId> select_neighbors(...) const;
+    int sample_layer() const;
+    std::vector<InternalId> search_layer(const float* q, int layer_number) const;
+    // std::vector<InternalId> select_neighbors() const;
+
+    // Return the id in `container` that is the extreme (by `better`) w.r.t. its
+    // distance to `q`. Pass std::less<>{} for nearest, std::greater<>{} for
+    // furthest. Generic over the container: works for a set, a vector, anything
+    // iterable of InternalId. Returns entry_point_ for an empty container.
+    template <typename Container, typename Compare>
+    InternalId extremum_in(const float* q, const Container& container, Compare better) const {
+        float best_dist = 0.0f;
+        InternalId best_id = entry_point_;
+        bool first = true;
+        for (InternalId id : container) {
+            float d = dist_fn_(q, nodes_[id].data.data(), config_.dim);
+            if (first || better(d, best_dist)) {
+                best_dist = d;
+                best_id = id;
+                first = false;
+            }
+        }
+        return best_id;
+    }
 };
 
 }  // namespace vdb
