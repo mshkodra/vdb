@@ -14,7 +14,7 @@ InternalId BruteIndex::add(const float* vec) {
 
 std::vector<std::pair<InternalId, float>> BruteIndex::search(const float* query,
                                                              size_t K) const {
-    using Entry = std::pair<InternalId, float>;  // (id, distance)
+    using Entry = std::pair<InternalId, float>;
 
     std::vector<Entry> all;
     all.reserve(data_.size());
@@ -38,4 +38,4 @@ std::vector<std::pair<InternalId, float>> BruteIndex::search(const float* query,
 size_t BruteIndex::size() const { return data_.size(); }
 size_t BruteIndex::dim() const { return dim_; }
 
-}  // namespace vdb
+}

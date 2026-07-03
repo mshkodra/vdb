@@ -6,19 +6,13 @@
 
 namespace vdb {
 
-// Hierarchical Navigable Small World graph index (HNSW) — ROADMAP Stage 3.
-//
-// Idea: a multi-layer proximity graph. Upper layers are sparse "express lanes"
-// for long hops; lower layers are dense for fine-grained search. A query does a
-// greedy descent from a single entry point down to layer 0. Built on the NSW /
-// skip-list intuition (Malkov & Yashunin 2018).
 struct HNSWConfig {
     size_t dim;
-    size_t M     = 16;   // connections per node per layer
-    size_t Mmax  = 16;   // max connections at layers > 0
-    size_t Mmax0 = 32;   // max connections at layer 0 (usually 2*M)
-    size_t ef    = 200;  // efConstruction — candidate width while building
-    float  mL    = 0.0f; // level-generation factor; set to 1/ln(M) in ctor
+    size_t M     = 16;
+    size_t Mmax  = 16;
+    size_t Mmax0 = 32;
+    size_t ef    = 200;
+    float  mL    = 0.0f;
 };
 
 class HNSWIndex : public Index {
@@ -31,13 +25,12 @@ public:
     size_t size() const override;
     size_t dim() const override;
 
-    // Search width knob, set per-query later. For now search() can use ef = K.
     void set_ef_search(size_t ef) { ef_search_ = ef; }
 
 private:
     struct Node {
         std::vector<float>                    data;
-        std::vector<std::vector<InternalId>>  neighbours;  // per layer
+        std::vector<std::vector<InternalId>>  neighbours;
     };
 
     HNSWConfig  config_;
@@ -47,16 +40,15 @@ private:
     size_t      ef_search_   = 50;
     mutable std::mt19937 rng_;
 
-    std::vector<Node> nodes_;  // TODO Stage 3
+    std::vector<Node> nodes_;
 
     int sample_layer() const;
-    std::vector<InternalId> search_layer(const float* q, int layer_number) const;
-    // std::vector<InternalId> select_neighbors() const;
+    std::vector<InternalId> search_layer(const float* q, InternalId ep, int layer_number) const;
 
-    // Return the id in `container` that is the extreme (by `better`) w.r.t. its
-    // distance to `q`. Pass std::less<>{} for nearest, std::greater<>{} for
-    // furthest. Generic over the container: works for a set, a vector, anything
-    // iterable of InternalId. Returns entry_point_ for an empty container.
+    std::vector<InternalId> select_nearest(const float* q,
+                                           std::vector<InternalId> cands,
+                                           size_t M) const;
+
     template <typename Container, typename Compare>
     InternalId extremum_in(const float* q, const Container& container, Compare better) const {
         float best_dist = 0.0f;
@@ -74,4 +66,4 @@ private:
     }
 };
 
-}  // namespace vdb
+}

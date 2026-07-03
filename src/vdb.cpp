@@ -24,19 +24,17 @@ std::unique_ptr<Index> make_index(const VDBConfig& cfg, DistanceFn dist_fn) {
     }
     return nullptr;
 }
-}  // namespace
+}
 
 VDB::VDB(VDBConfig cfg) : config_(cfg) {
     index_ = make_index(config_, metric_fn(config_.metric));
 }
 
 ExternalId VDB::insert(const float* vec) {
-    // TODO Stage 5: allocate an ExternalId, map it to the InternalId from add().
     return static_cast<ExternalId>(index_->add(vec));
 }
 
 std::vector<ExternalId> VDB::search(const float* query, size_t K) const {
-    // TODO Stage 5: translate InternalIds back to ExternalIds, skip tombstones.
     std::vector<ExternalId> out;
     for (auto& [id, dist] : index_->search(query, K)) {
         (void)dist;
@@ -48,4 +46,4 @@ std::vector<ExternalId> VDB::search(const float* query, size_t K) const {
 size_t VDB::size() const { return index_->size(); }
 size_t VDB::dim() const { return index_->dim(); }
 
-}  // namespace vdb
+}

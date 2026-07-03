@@ -4,13 +4,6 @@
 
 #include <cmath>
 
-// Stage 1 — brute-force index (the exact ground-truth oracle).
-//
-// These tests use a LOCAL L2-squared distance (below), not src/distance.cpp, so
-// they isolate the index logic — add() id allocation, top-K selection, ordering —
-// from whether your distance metric is finished. A failure here is a brute-index
-// bug, not a metric bug.
-
 namespace {
 
 bool near(float a, float b, float eps = 1e-4f) {
@@ -28,16 +21,14 @@ DistanceFn l2sq() {
     };
 }
 
-}  // namespace
-
-// ---- lifecycle: dim/size/ids ------------------------------------------------
+}
 
 TEST(brute_empty_index) {
     vdb::BruteIndex idx(4, l2sq());
     EXPECT(idx.dim() == 4);
     EXPECT(idx.size() == 0);
     float q[] = {0.0f, 0.0f, 0.0f, 0.0f};
-    EXPECT(idx.search(q, 5).empty());  // nothing to return
+    EXPECT(idx.search(q, 5).empty());
 }
 
 TEST(brute_add_returns_sequential_ids) {
@@ -50,14 +41,6 @@ TEST(brute_add_returns_sequential_ids) {
     EXPECT(idx.add(c) == 2u);
     EXPECT(idx.size() == 3);
 }
-
-// ---- search correctness: a fixed, hand-computed dataset ---------------------
-//
-// Points (dim=2), L2^2 distance from query {0,0}:
-//   id0 {0,0} -> 0
-//   id1 {1,0} -> 1
-//   id2 {0,2} -> 4
-//   id3 {3,0} -> 9
 
 namespace {
 vdb::BruteIndex fixture() {
@@ -72,7 +55,7 @@ vdb::BruteIndex fixture() {
     idx.add(p3);
     return idx;
 }
-}  // namespace
+}
 
 TEST(brute_returns_nearest_first) {
     auto idx = fixture();
@@ -90,13 +73,13 @@ TEST(brute_results_ordered_by_distance) {
     auto res = idx.search(q, 4);
     ASSERT(res.size() == 4);
     for (size_t i = 1; i < res.size(); ++i) {
-        EXPECT(res[i - 1].second <= res[i].second);  // non-decreasing
+        EXPECT(res[i - 1].second <= res[i].second);
     }
 }
 
 TEST(brute_self_query_finds_self_at_zero) {
     auto idx = fixture();
-    float q[] = {0.0f, 2.0f};  // exactly id2
+    float q[] = {0.0f, 2.0f};
     auto res = idx.search(q, 1);
     ASSERT(res.size() == 1);
     EXPECT(res[0].first == 2u);
@@ -105,20 +88,18 @@ TEST(brute_self_query_finds_self_at_zero) {
 
 TEST(brute_near_miss_query) {
     auto idx = fixture();
-    float q[] = {0.9f, 0.0f};   // closest to id1 {1,0}
+    float q[] = {0.9f, 0.0f};
     auto res = idx.search(q, 1);
     ASSERT(res.size() == 1);
     EXPECT(res[0].first == 1u);
-    EXPECT(near(res[0].second, 0.01f));  // (0.9-1.0)^2
+    EXPECT(near(res[0].second, 0.01f));
 }
-
-// ---- K edge cases -----------------------------------------------------------
 
 TEST(brute_k_larger_than_size_returns_all) {
     auto idx = fixture();
     float q[] = {0.0f, 0.0f};
     auto res = idx.search(q, 100);
-    EXPECT(res.size() == 4);  // only 4 vectors exist
+    EXPECT(res.size() == 4);
 }
 
 TEST(brute_k_zero_returns_empty) {

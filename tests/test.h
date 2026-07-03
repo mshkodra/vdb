@@ -49,7 +49,7 @@ inline int run_all() {
     return failed == 0 ? 0 : 1;
 }
 
-}  // namespace vdb_test
+}
 
 #define TEST(name)                                                             \
     static void test_##name(int& _vdb_fail);                                   \

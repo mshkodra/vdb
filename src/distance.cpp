@@ -49,4 +49,4 @@ DistanceFn metric_fn(Metric m) {
     return &l2_squared;
 }
 
-}  // namespace vdb
+}
