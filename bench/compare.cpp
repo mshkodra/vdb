@@ -24,7 +24,7 @@ namespace {
 //  EXPERIMENT GRID  —  this block is yours to design (see CLAUDE.md).
 //  Everything below it is plumbing. Change these; predict before running.
 // ============================================================================
-constexpr size_t N   = 2000;    // vectors per dataset (HNSW build is the limiter)
+constexpr size_t N   = 20000;   // vectors per dataset
 constexpr size_t DIM = 128;
 constexpr size_t K   = 10;      // neighbours per query
 constexpr size_t Q   = 200;     // query set size
@@ -39,7 +39,7 @@ const std::vector<size_t> IVF_NPROBE = {1, 4, 8, 16, 32, 64,
 constexpr size_t IVF_KMEANS_ITERS = 25;
 
 // HNSW: fixed M; sweep ef (search-time knob). Build once per (dataset, M).
-constexpr size_t HNSW_M = 16;
+constexpr size_t HNSW_M = 32;
 constexpr size_t HNSW_EF_CONSTRUCTION = 100;  // build-time candidate width
 const std::vector<size_t> HNSW_EF = {10, 20, 40, 80, 160, 320};
 // ============================================================================
@@ -235,6 +235,37 @@ void run_dataset(const char* name, const std::vector<float>& data,
 }
 
 }  // namespace
+
+// Diagnostic: how much does HNSW clustered recall move with only the RNG seed?
+// Builds the same graph at several seeds; reports mean/min/max at fixed ef.
+void run_seed_study() {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    const size_t n = 4000, dim = 128, M = 32, efc = 100, ef_search = 160;
+    auto metric = vdb::metric_fn(vdb::Metric::L2);
+    auto data = clustered_flat(n, dim, CLUSTERS, SPREAD, 1);
+    auto queries = clustered_flat(Q, dim, CLUSTERS, SPREAD, 2);
+
+    vdb::BruteIndex oracle(dim, metric);
+    for (size_t i = 0; i < n; ++i) oracle.add(data.data() + i * dim);
+    auto truth = truth_sets(oracle, queries.data(), dim);
+
+    std::printf("\n== HNSW clustered seed variance "
+                "(n=%zu, M=%zu, efc=%zu, ef=%zu) ==\n", n, M, efc, ef_search);
+    double sum = 0, mn = 1e9, mx = 0;
+    const unsigned seeds = 6;
+    for (unsigned s = 1; s <= seeds; ++s) {
+        vdb::HNSWIndex h({dim, M, M, 2 * M, efc, 0.0f, s}, metric);
+        for (size_t i = 0; i < n; ++i) h.add(data.data() + i * dim);
+        h.set_ef_search(ef_search);
+        double rec = recall_at_k(h, truth, queries.data(), dim);
+        std::printf("  seed %u: recall %.3f\n", s, rec);
+        sum += rec;
+        mn = std::min(mn, rec);
+        mx = std::max(mx, rec);
+    }
+    std::printf("  mean %.3f  min %.3f  max %.3f  (spread %.3f)\n",
+                sum / seeds, mn, mx, mx - mn);
+}
 
 void run_compare() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // live progress even when piped

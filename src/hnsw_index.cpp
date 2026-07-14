@@ -11,7 +11,7 @@
 namespace vdb {
 
 HNSWIndex::HNSWIndex(HNSWConfig cfg, DistanceFn dist_fn)
-    : config_(cfg), dist_fn_(std::move(dist_fn)), rng_(std::random_device{}()) {
+    : config_(cfg), dist_fn_(std::move(dist_fn)), rng_(cfg.seed) {
     if (config_.mL <= 0.0f) {
         config_.mL = 1.0f / std::log(static_cast<float>(config_.M));
     }
@@ -63,17 +63,45 @@ std::vector<InternalId> HNSWIndex::search_layer(const float* q, InternalId ep,
     return result;
 }
 
-std::vector<InternalId> HNSWIndex::select_nearest(const float* q,
-                                                  std::vector<InternalId> cands,
-                                                  size_t M) const {
+// Malkov Alg. 4: keep a candidate only if it is closer to the base q than to any
+// already-selected neighbour. This spreads links across *directions* instead of
+// piling them onto the M nearest (which, in a tight cluster, all point inward and
+// leave the cluster poorly bridged). keepPrunedConnections tops the result back up
+// to M from the discarded set so connectivity is preserved.
+std::vector<InternalId> HNSWIndex::select_neighbors(const float* q,
+                                                    std::vector<InternalId> cands,
+                                                    size_t M) const {
     if (cands.size() <= M) return cands;
-    std::partial_sort(cands.begin(), cands.begin() + M, cands.end(),
-                      [&](InternalId a, InternalId b) {
-                          return dist_fn_(q, nodes_[a].data.data(), config_.dim) <
-                                 dist_fn_(q, nodes_[b].data.data(), config_.dim);
-                      });
-    cands.resize(M);
-    return cands;
+
+    // Process candidates nearest-to-q first.
+    std::sort(cands.begin(), cands.end(), [&](InternalId a, InternalId b) {
+        return dist_fn_(q, nodes_[a].data.data(), config_.dim) <
+               dist_fn_(q, nodes_[b].data.data(), config_.dim);
+    });
+
+    std::vector<InternalId> result;
+    std::vector<InternalId> discarded;
+    result.reserve(M);
+    for (InternalId e : cands) {
+        if (result.size() >= M) break;
+        const float d_eq = dist_fn_(q, nodes_[e].data.data(), config_.dim);
+        bool closer_to_q = true;
+        for (InternalId r : result) {
+            const float d_er = dist_fn_(nodes_[e].data.data(),
+                                        nodes_[r].data.data(), config_.dim);
+            if (d_er < d_eq) {  // e sits nearer an existing neighbour than to q
+                closer_to_q = false;
+                break;
+            }
+        }
+        (closer_to_q ? result : discarded).push_back(e);
+    }
+
+    for (InternalId e : discarded) {  // keepPrunedConnections
+        if (result.size() >= M) break;
+        result.push_back(e);
+    }
+    return result;
 }
 
 InternalId HNSWIndex::add(const float* vec) {
@@ -101,7 +129,7 @@ InternalId HNSWIndex::add(const float* vec) {
 
     for (int lc = std::min(L, l); lc >= 0; lc--) {
         std::vector<InternalId> W = search_layer(vec, ep, config_.ef, lc);
-        std::vector<InternalId> neighbours = select_nearest(vec, W, config_.M);
+        std::vector<InternalId> neighbours = select_neighbors(vec, W, config_.M);
 
         const size_t Mmax = (lc == 0) ? config_.Mmax0 : config_.Mmax;
 
@@ -111,7 +139,7 @@ InternalId HNSWIndex::add(const float* vec) {
             auto& e_conn = nodes_[e].neighbours[lc];
             e_conn.push_back(id);
             if (e_conn.size() > Mmax) {
-                e_conn = select_nearest(nodes_[e].data.data(), e_conn, Mmax);
+                e_conn = select_neighbors(nodes_[e].data.data(), e_conn, Mmax);
             }
         }
 

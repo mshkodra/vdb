@@ -13,6 +13,7 @@ struct HNSWConfig {
     size_t Mmax0 = 32;
     size_t ef    = 200;
     float  mL    = 0.0f;
+    unsigned seed = 42;  // level sampler RNG seed; fixed for reproducible builds
 };
 
 class HNSWIndex : public Index {
@@ -46,9 +47,9 @@ private:
     std::vector<InternalId> search_layer(const float* q, InternalId ep, size_t ef,
                                          int layer_number) const;
 
-    std::vector<InternalId> select_nearest(const float* q,
-                                           std::vector<InternalId> cands,
-                                           size_t M) const;
+    std::vector<InternalId> select_neighbors(const float* q,
+                                             std::vector<InternalId> cands,
+                                             size_t M) const;
 
     template <typename Container, typename Compare>
     InternalId extremum_in(const float* q, const Container& container, Compare better) const {
