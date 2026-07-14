@@ -1,4 +1,5 @@
 #include "bench.h"
+#include "compare.h"
 
 #include "brute_index.h"
 #include "distance.h"
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -308,12 +310,19 @@ void bench_hnsw() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // `run_bench compare` runs only the Stage 4 comparison (fast); no args runs
+    // the full Stage 1-3 sweeps too (the IVF k-means retraining is slow).
+    if (argc > 1 && std::string(argv[1]) == "compare") {
+        run_compare();
+        return 0;
+    }
     std::printf("vdb Stage 1 benchmarks — compare MIN columns across versions\n");
     bench_distance();
     bench_brute();
     bench_ivf();
     bench_ivf_clustered();
     bench_hnsw();
+    run_compare();
     return 0;
 }
