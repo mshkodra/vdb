@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <queue>
 #include <random>
 #include <utility>
 #include <unordered_set>
@@ -22,39 +23,44 @@ int HNSWIndex::sample_layer() const {
     return static_cast<int>(r);
 }
 
-std::vector<InternalId> HNSWIndex::search_layer(const float* q, InternalId ep, int layer_number) const {
-    std::unordered_set<InternalId> visited = {ep};
-    std::unordered_set<InternalId> candidates = {ep};
+std::vector<InternalId> HNSWIndex::search_layer(const float* q, InternalId ep,
+                                                size_t ef, int layer_number) const {
+    using DI = std::pair<float, InternalId>;  // (distance to q, node id)
 
-    std::unordered_set<InternalId> found_neighbours = {ep};
+    std::unordered_set<InternalId> visited{ep};
+    // candidates: min-heap on distance (nearest to expand next on top).
+    std::priority_queue<DI, std::vector<DI>, std::greater<>> candidates;
+    // W: max-heap on distance (current worst result on top, so we can evict it).
+    std::priority_queue<DI> W;
+
+    const float d_ep = dist_fn_(q, nodes_[ep].data.data(), config_.dim);
+    candidates.emplace(d_ep, ep);
+    W.emplace(d_ep, ep);
 
     while (!candidates.empty()) {
-        InternalId c = extremum_in(q, candidates, std::less<>{});
-        candidates.erase(c);
+        auto [dc, c] = candidates.top();
+        candidates.pop();
+        if (dc > W.top().first) break;  // nearest candidate farther than worst result
 
-        InternalId f = extremum_in(q, found_neighbours, std::greater<>{});
+        for (InternalId id : nodes_[c].neighbours[layer_number]) {
+            if (!visited.insert(id).second) continue;
 
-        float dcq = dist_fn_(q, nodes_[c].data.data(), config_.dim);
-        float dfq = dist_fn_(q, nodes_[f].data.data(), config_.dim);
-        if(dcq > dfq) break;
-
-        for(InternalId id : nodes_[c].neighbours[layer_number]) {
-            if(visited.find(id) != visited.end()) continue;
-
-            visited.insert(id);
-            f = extremum_in(q, found_neighbours, std::greater<>{});
-            dfq = dist_fn_(q, nodes_[f].data.data(), config_.dim);
-
-            if(dist_fn_(nodes_[id].data.data(), q, config_.dim) >= dfq && found_neighbours.size() >= config_.ef) continue;
-
-            candidates.insert(id);
-            found_neighbours.insert(id);
-
-            if(found_neighbours.size() > config_.ef) found_neighbours.erase(f);
+            const float d = dist_fn_(q, nodes_[id].data.data(), config_.dim);
+            if (W.size() < ef || d < W.top().first) {
+                candidates.emplace(d, id);
+                W.emplace(d, id);
+                if (W.size() > ef) W.pop();
+            }
         }
     }
 
-    return std::vector<InternalId>(found_neighbours.begin(), found_neighbours.end());
+    std::vector<InternalId> result;
+    result.reserve(W.size());
+    while (!W.empty()) {
+        result.push_back(W.top().second);
+        W.pop();
+    }
+    return result;
 }
 
 std::vector<InternalId> HNSWIndex::select_nearest(const float* q,
@@ -89,12 +95,12 @@ InternalId HNSWIndex::add(const float* vec) {
     InternalId ep = entry_point_;
 
     for (int lc = L; lc > l; lc--) {
-        std::vector<InternalId> W = search_layer(vec, ep, lc);
+        std::vector<InternalId> W = search_layer(vec, ep, 1, lc);
         ep = extremum_in(vec, W, std::less<>{});
     }
 
     for (int lc = std::min(L, l); lc >= 0; lc--) {
-        std::vector<InternalId> W = search_layer(vec, ep, lc);
+        std::vector<InternalId> W = search_layer(vec, ep, config_.ef, lc);
         std::vector<InternalId> neighbours = select_nearest(vec, W, config_.M);
 
         const size_t Mmax = (lc == 0) ? config_.Mmax0 : config_.Mmax;
@@ -126,11 +132,11 @@ std::vector<std::pair<InternalId, float>> HNSWIndex::search(const float* query,
 
     InternalId ep = entry_point_;
     for (int lc = max_layer_; lc > 0; lc--) {
-        std::vector<InternalId> W = search_layer(query, ep, lc);
+        std::vector<InternalId> W = search_layer(query, ep, 1, lc);
         ep = extremum_in(query, W, std::less<>{});
     }
 
-    std::vector<InternalId> W = search_layer(query, ep, 0);
+    std::vector<InternalId> W = search_layer(query, ep, std::max(ef_search_, K), 0);
 
     std::vector<std::pair<InternalId, float>> results;
     results.reserve(W.size());

@@ -43,7 +43,8 @@ private:
     std::vector<Node> nodes_;
 
     int sample_layer() const;
-    std::vector<InternalId> search_layer(const float* q, InternalId ep, int layer_number) const;
+    std::vector<InternalId> search_layer(const float* q, InternalId ep, size_t ef,
+                                         int layer_number) const;
 
     std::vector<InternalId> select_nearest(const float* q,
                                            std::vector<InternalId> cands,
