@@ -1,0 +1,345 @@
+#include "wal.h"
+
+#include "crc32c.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <stdexcept>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace vdb {
+namespace {
+
+// Little-endian host assumed; serialization is raw memcpy of native integers.
+template <typename T>
+void put(std::vector<uint8_t>& buf, T v) {
+    const auto* p = reinterpret_cast<const uint8_t*>(&v);
+    buf.insert(buf.end(), p, p + sizeof(T));
+}
+
+template <typename T>
+T get(const uint8_t* p) {
+    T v;
+    std::memcpy(&v, p, sizeof(T));
+    return v;
+}
+
+// type + lsn + one u64 (ext_id or snapshot_id); Insert/Update append the vector.
+constexpr size_t kBodyPrefix = sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint64_t);
+
+}  // namespace
+
+std::vector<uint8_t> encode_header(uint32_t dim, uint8_t metric) {
+    std::vector<uint8_t> buf;
+    buf.reserve(kWalHeaderSize);
+    put(buf, kWalMagic);
+    put(buf, kWalVersion);
+    put(buf, dim);
+    put(buf, metric);
+    buf.resize(kWalHeaderSize, 0);
+    return buf;
+}
+
+bool decode_header(const uint8_t* data, size_t avail, WalHeader& out) {
+    if (avail < kWalHeaderSize) return false;
+    size_t off = 0;
+    out.magic   = get<uint32_t>(data + off); off += sizeof(uint32_t);
+    out.version = get<uint16_t>(data + off); off += sizeof(uint16_t);
+    out.dim     = get<uint32_t>(data + off); off += sizeof(uint32_t);
+    out.metric  = get<uint8_t>(data + off);
+    return out.magic == kWalMagic && out.version == kWalVersion;
+}
+
+std::vector<uint8_t> encode_record(const WalRecord& r) {
+    std::vector<uint8_t> body;
+    body.reserve(kBodyPrefix + r.vec.size() * sizeof(float));
+    put(body, static_cast<uint8_t>(r.type));
+    put(body, r.lsn);
+    put(body, r.ext_id);
+    if (r.type == WalRecordType::Insert || r.type == WalRecordType::Update) {
+        const auto* vp = reinterpret_cast<const uint8_t*>(r.vec.data());
+        body.insert(body.end(), vp, vp + r.vec.size() * sizeof(float));
+    }
+
+    const uint32_t length = static_cast<uint32_t>(body.size());
+
+    // crc over the length field then the body, so a corrupted length is caught too.
+    std::vector<uint8_t> crc_input;
+    crc_input.reserve(sizeof(uint32_t) + body.size());
+    put(crc_input, length);
+    crc_input.insert(crc_input.end(), body.begin(), body.end());
+    const uint32_t crc = crc32c(crc_input.data(), crc_input.size());
+
+    std::vector<uint8_t> frame;
+    frame.reserve(2 * sizeof(uint32_t) + body.size());
+    put(frame, length);
+    put(frame, crc);
+    frame.insert(frame.end(), body.begin(), body.end());
+    return frame;
+}
+
+DecodeStatus decode_record(const uint8_t* data, size_t avail,
+                           WalRecord& out, size_t& consumed) {
+    consumed = 0;
+
+    constexpr size_t kFrameHeader = 2 * sizeof(uint32_t);
+    if (avail < kFrameHeader) return DecodeStatus::Incomplete;
+
+    const uint32_t length     = get<uint32_t>(data);
+    const uint32_t stored_crc = get<uint32_t>(data + sizeof(uint32_t));
+    if (avail < kFrameHeader + static_cast<size_t>(length))
+        return DecodeStatus::Incomplete;
+
+    const uint8_t* body = data + kFrameHeader;
+
+    std::vector<uint8_t> crc_input;
+    crc_input.reserve(sizeof(uint32_t) + length);
+    crc_input.insert(crc_input.end(), data, data + sizeof(uint32_t));
+    crc_input.insert(crc_input.end(), body, body + length);
+    if (crc32c(crc_input.data(), crc_input.size()) != stored_crc)
+        return DecodeStatus::BadCrc;
+
+    // Checksum-valid but malformed framing: treat as corruption, not a valid decode.
+    if (length < kBodyPrefix) return DecodeStatus::BadCrc;
+    const size_t vec_bytes = length - kBodyPrefix;
+    if (vec_bytes % sizeof(float) != 0) return DecodeStatus::BadCrc;
+
+    size_t off = 0;
+    out.type   = static_cast<WalRecordType>(get<uint8_t>(body + off)); off += sizeof(uint8_t);
+    out.lsn    = get<uint64_t>(body + off); off += sizeof(uint64_t);
+    out.ext_id = get<uint64_t>(body + off); off += sizeof(uint64_t);
+    out.vec.resize(vec_bytes / sizeof(float));
+    if (vec_bytes) std::memcpy(out.vec.data(), body + off, vec_bytes);
+
+    consumed = kFrameHeader + length;
+    return DecodeStatus::Ok;
+}
+
+// ---- Wal --------------------------------------------------------------------
+
+Wal::~Wal() {
+    if (active_fd_ >= 0) ::close(active_fd_);
+}
+
+void Wal::sys_check(bool ok, const char* what) {
+    if (!ok) throw std::runtime_error(std::string(what) + ": " + std::strerror(errno));
+}
+
+std::string Wal::segment_path_(uint64_t number) const {
+    char name[32];
+    std::snprintf(name, sizeof(name), "wal-%012llu.log",
+                  static_cast<unsigned long long>(number));
+    return (std::filesystem::path(dir_) / name).string();
+}
+
+std::vector<uint64_t> Wal::discover_segments_() const {
+    const std::string kExample = "wal-000000000001.log";
+    std::vector<uint64_t> numbers;
+    for (const auto& entry : std::filesystem::directory_iterator(dir_)) {
+        if (!entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.size() != kExample.size()) continue;
+        if (name.compare(0, 4, "wal-") != 0) continue;
+        if (name.compare(name.size() - 4, 4, ".log") != 0) continue;
+        try {
+            numbers.push_back(std::stoull(name.substr(4, name.size() - 8)));
+        } catch (...) {
+            continue;
+        }
+    }
+    std::sort(numbers.begin(), numbers.end());
+    return numbers;
+}
+
+void Wal::write_at_(int fd, long long off, const void* data, size_t len) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    size_t written = 0;
+    while (written < len) {
+        const ssize_t n = ::pwrite(fd, p + written, len - written,
+                                   static_cast<off_t>(off) + static_cast<off_t>(written));
+        sys_check(n > 0, "pwrite WAL");
+        written += static_cast<size_t>(n);
+    }
+}
+
+void Wal::fsync_dir_() {
+    const int dfd = ::open(dir_.c_str(), O_RDONLY);
+    sys_check(dfd >= 0, "open dir for fsync");
+    if (::fsync(dfd) != 0 && errno != EINVAL) {  // some platforms reject dir fsync
+        const int saved = errno;
+        ::close(dfd);
+        errno = saved;
+        sys_check(false, "fsync dir");
+    }
+    ::close(dfd);
+}
+
+std::vector<uint8_t> Wal::read_file_(const std::string& path) const {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    sys_check(fd >= 0, "open WAL segment for read");
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        const int saved = errno;
+        ::close(fd);
+        errno = saved;
+        sys_check(false, "fstat WAL segment");
+    }
+    std::vector<uint8_t> buf(static_cast<size_t>(st.st_size));
+    size_t rd = 0;
+    while (rd < buf.size()) {
+        const ssize_t n = ::read(fd, buf.data() + rd, buf.size() - rd);
+        if (n == 0) break;
+        if (n < 0) {
+            const int saved = errno;
+            ::close(fd);
+            errno = saved;
+            sys_check(false, "read WAL segment");
+        }
+        rd += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    buf.resize(rd);
+    return buf;
+}
+
+void Wal::open_new_segment_() {
+    const uint64_t number = segments_.empty() ? 1 : segments_.back().number + 1;
+    const std::string path = segment_path_(number);
+
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    sys_check(fd >= 0, "create WAL segment");
+
+    const auto hdr = encode_header(dim_, metric_);
+    write_at_(fd, 0, hdr.data(), hdr.size());
+    sys_check(::fsync(fd) == 0, "fsync new WAL segment");
+    fsync_dir_();  // persist the new directory entry
+
+    segments_.push_back(Segment{number, path, 0, 0, false});
+    active_fd_    = fd;
+    active_bytes_ = hdr.size();
+}
+
+void Wal::rotate_() {
+    sys_check(::fsync(active_fd_) == 0, "fsync before rotate");
+    sys_check(::close(active_fd_) == 0, "close active segment");
+    active_fd_ = -1;
+    segments_.back().sealed = true;
+    open_new_segment_();
+}
+
+void Wal::open(const std::string& dir, uint32_t dim, uint8_t metric, Options opts) {
+    dir_     = dir;
+    dim_     = dim;
+    metric_  = metric;
+    seg_max_ = opts.segment_max_bytes;
+    std::filesystem::create_directories(dir_);
+
+    const std::vector<uint64_t> numbers = discover_segments_();
+    if (numbers.empty()) {
+        open_new_segment_();
+        return;
+    }
+
+    for (size_t i = 0; i < numbers.size(); ++i) {
+        segments_.push_back(Segment{numbers[i], segment_path_(numbers[i]), 0, 0,
+                                    /*sealed=*/i + 1 < numbers.size()});
+    }
+    const int fd = ::open(segments_.back().path.c_str(), O_WRONLY, 0644);
+    sys_check(fd >= 0, "open active WAL segment");
+    active_fd_    = fd;
+    active_bytes_ = static_cast<size_t>(std::filesystem::file_size(segments_.back().path));
+}
+
+void Wal::replay(const std::function<void(const WalRecord&)>& on_record) {
+    for (size_t si = 0; si < segments_.size(); ++si) {
+        Segment&   seg       = segments_[si];
+        const bool is_active = (si + 1 == segments_.size());
+        const std::vector<uint8_t> bytes = read_file_(seg.path);
+
+        WalHeader h;
+        if (!decode_header(bytes.data(), bytes.size(), h))
+            throw std::runtime_error("WAL segment header invalid: " + seg.path);
+        if (h.dim != dim_ || h.metric != metric_)
+            throw std::runtime_error("WAL config mismatch: " + seg.path);
+
+        size_t off  = kWalHeaderSize;
+        bool   torn = false;
+        while (off < bytes.size()) {
+            WalRecord    rec;
+            size_t       consumed = 0;
+            const DecodeStatus st =
+                decode_record(bytes.data() + off, bytes.size() - off, rec, consumed);
+
+            if (st == DecodeStatus::Ok) {
+                on_record(rec);
+                if (seg.first_lsn == 0) seg.first_lsn = rec.lsn;
+                seg.last_lsn = rec.lsn;
+                if (rec.lsn > highest_lsn_) highest_lsn_ = rec.lsn;
+                off += consumed;
+                continue;
+            }
+
+            if (!is_active)
+                throw std::runtime_error("WAL corruption in sealed segment: " + seg.path);
+
+            // Torn tail: cut back to the last good boundary for a clean append point.
+            sys_check(::ftruncate(active_fd_, static_cast<off_t>(off)) == 0,
+                      "ftruncate torn tail");
+            sys_check(::fsync(active_fd_) == 0, "fsync after truncate");
+            active_bytes_ = off;
+            torn          = true;
+            break;
+        }
+        if (is_active && !torn) active_bytes_ = bytes.size();
+    }
+}
+
+void Wal::append(const WalRecord& r) {
+    sys_check(active_fd_ >= 0, "WAL not open");
+    const std::vector<uint8_t> frame = encode_record(r);
+
+    // Seal-early rotate; the "has a record" guard avoids looping on an oversized one.
+    if (active_bytes_ > kWalHeaderSize && active_bytes_ + frame.size() > seg_max_)
+        rotate_();
+
+    write_at_(active_fd_, static_cast<long long>(active_bytes_), frame.data(), frame.size());
+    active_bytes_ += frame.size();
+
+    Segment& seg = segments_.back();
+    if (seg.first_lsn == 0) seg.first_lsn = r.lsn;
+    seg.last_lsn = r.lsn;
+    if (r.lsn > highest_lsn_) highest_lsn_ = r.lsn;
+}
+
+void Wal::sync() {
+    sys_check(active_fd_ >= 0, "WAL not open");
+    sys_check(::fsync(active_fd_) == 0, "fsync WAL");
+}
+
+void Wal::truncate(uint64_t upto_lsn) {
+    std::vector<Segment> survivors;
+    survivors.reserve(segments_.size());
+    bool removed = false;
+
+    for (size_t i = 0; i < segments_.size(); ++i) {
+        Segment&   seg       = segments_[i];
+        const bool is_active = (i + 1 == segments_.size());
+        if (!is_active && seg.sealed && seg.last_lsn != 0 && seg.last_lsn <= upto_lsn) {
+            sys_check(::unlink(seg.path.c_str()) == 0, "unlink WAL segment");
+            removed = true;
+        } else {
+            survivors.push_back(seg);
+        }
+    }
+
+    segments_.swap(survivors);
+    if (removed) fsync_dir_();
+}
+
+}
