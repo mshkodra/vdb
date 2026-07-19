@@ -180,4 +180,37 @@ std::vector<std::pair<InternalId, float>> HNSWIndex::search(const float* query,
 size_t HNSWIndex::size() const { return nodes_.size(); }
 size_t HNSWIndex::dim() const { return config_.dim; }
 
+void HNSWIndex::serialize(std::vector<uint8_t>& out) const {
+    put<uint32_t>(out, entry_point_);
+    put<int32_t>(out, max_layer_);
+    put<uint64_t>(out, ef_search_);
+    put<uint64_t>(out, nodes_.size());
+    for (const auto& node : nodes_) {
+        put_floats(out, node.data);
+        put<uint64_t>(out, node.neighbours.size());
+        for (const auto& layer : node.neighbours) {
+            put<uint64_t>(out, layer.size());
+            for (InternalId id : layer) put<uint32_t>(out, id);
+        }
+    }
+}
+
+void HNSWIndex::deserialize(Reader& r) {
+    entry_point_ = r.get<uint32_t>();
+    max_layer_   = r.get<int32_t>();
+    ef_search_   = r.get<uint64_t>();
+    const uint64_t n = r.get<uint64_t>();
+    nodes_.resize(n);
+    for (uint64_t i = 0; i < n; ++i) {
+        nodes_[i].data = r.get_floats();
+        const uint64_t nl = r.get<uint64_t>();
+        nodes_[i].neighbours.resize(nl);
+        for (uint64_t l = 0; l < nl; ++l) {
+            const uint64_t m = r.get<uint64_t>();
+            nodes_[i].neighbours[l].resize(m);
+            for (uint64_t j = 0; j < m; ++j) nodes_[i].neighbours[l][j] = r.get<uint32_t>();
+        }
+    }
+}
+
 }

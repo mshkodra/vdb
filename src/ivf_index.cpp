@@ -125,4 +125,38 @@ std::vector<std::pair<InternalId, float>> IVFIndex::search(const float* query,
 size_t IVFIndex::size() const { return vectors_.size(); }
 size_t IVFIndex::dim() const { return config_.dim; }
 
+void IVFIndex::serialize(std::vector<uint8_t>& out) const {
+    put<uint8_t>(out, trained_ ? 1 : 0);
+    put<uint64_t>(out, config_.nlist);
+    put<uint64_t>(out, config_.nprobe);
+    put<uint64_t>(out, centroids_.size());
+    for (const auto& c : centroids_) put_floats(out, c);
+    put<uint64_t>(out, inverted_lists_.size());
+    for (const auto& lst : inverted_lists_) {
+        put<uint64_t>(out, lst.size());
+        for (InternalId id : lst) put<uint32_t>(out, id);
+    }
+    put<uint64_t>(out, vectors_.size());
+    for (const auto& v : vectors_) put_floats(out, v);
+}
+
+void IVFIndex::deserialize(Reader& r) {
+    trained_       = r.get<uint8_t>() != 0;
+    config_.nlist  = r.get<uint64_t>();
+    config_.nprobe = r.get<uint64_t>();
+    const uint64_t nc = r.get<uint64_t>();
+    centroids_.resize(nc);
+    for (uint64_t i = 0; i < nc; ++i) centroids_[i] = r.get_floats();
+    const uint64_t nl = r.get<uint64_t>();
+    inverted_lists_.resize(nl);
+    for (uint64_t i = 0; i < nl; ++i) {
+        const uint64_t m = r.get<uint64_t>();
+        inverted_lists_[i].resize(m);
+        for (uint64_t j = 0; j < m; ++j) inverted_lists_[i][j] = r.get<uint32_t>();
+    }
+    const uint64_t nv = r.get<uint64_t>();
+    vectors_.resize(nv);
+    for (uint64_t i = 0; i < nv; ++i) vectors_[i] = r.get_floats();
+}
+
 }

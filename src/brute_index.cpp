@@ -38,4 +38,17 @@ std::vector<std::pair<InternalId, float>> BruteIndex::search(const float* query,
 size_t BruteIndex::size() const { return data_.size(); }
 size_t BruteIndex::dim() const { return dim_; }
 
+void BruteIndex::serialize(std::vector<uint8_t>& out) const {
+    put<uint64_t>(out, dim_);
+    put<uint64_t>(out, data_.size());
+    for (const auto& v : data_) put_floats(out, v);
+}
+
+void BruteIndex::deserialize(Reader& r) {
+    dim_ = r.get<uint64_t>();
+    const uint64_t n = r.get<uint64_t>();
+    data_.resize(n);
+    for (uint64_t i = 0; i < n; ++i) data_[i] = r.get_floats();
+}
+
 }

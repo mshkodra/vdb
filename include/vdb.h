@@ -1,5 +1,7 @@
 #pragma once
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -30,6 +32,9 @@ struct VDBConfig {
 class VDB {
 public:
     explicit VDB(VDBConfig cfg);
+
+    friend void     save_snapshot(const VDB& db, const std::string& path, uint64_t lsn);
+    friend uint64_t load_snapshot(VDB& db, const std::string& path);
 
     // Insert a new vector; returns its freshly minted, stable ExternalId.
     ExternalId insert(const float* vec);
@@ -73,6 +78,8 @@ private:
 
     // Append `vec` as a fresh internal node, keeping the parallel arrays in step.
     InternalId append_(ExternalId ext, const float* vec);
+
+    static std::unique_ptr<Index> make_index_(const VDBConfig& cfg, DistanceFn dist_fn);
 };
 
 }

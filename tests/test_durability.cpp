@@ -1,6 +1,9 @@
 #include "test.h"
 
 #include "crc32c.h"
+#include "distance.h"
+#include "snapshot.h"
+#include "vdb.h"
 #include "wal.h"
 
 #include <cstdint>
@@ -230,6 +233,116 @@ TEST(wal_truncate_reclaims_covered_segments) {
     ASSERT(!lsns.empty());
     EXPECT(lsns.front() == 3);  // 1 and 2 lived in the reclaimed segment
     EXPECT(lsns.back() == 6);
+
+    std::filesystem::remove_all(dir);
+}
+
+// ---- Snapshots --------------------------------------------------------------
+
+TEST(snapshot_brute_round_trip) {
+    const std::string dir = fresh_wal_dir();
+    std::filesystem::create_directories(dir);
+    const std::string path = dir + "/snap";
+
+    VDBConfig cfg;
+    cfg.kind = IndexKind::Brute;
+    cfg.dim = 3;
+    cfg.metric = Metric::L2;
+
+    const float q[3] = {0.1f, 0.2f, 0.3f};
+    std::vector<ExternalId> ids;
+    std::vector<ExternalId> want;
+    {
+        VDB db(cfg);
+        for (int i = 0; i < 20; ++i) {
+            const float v[3] = {float(i), float((i * 2) % 7), float(i % 5)};
+            ids.push_back(db.insert(v));
+        }
+        db.remove(ids[3]);
+        db.remove(ids[7]);
+        want = db.search(q, 5);
+        save_snapshot(db, path, 123);
+    }
+
+    VDB db2(cfg);
+    EXPECT(load_snapshot(db2, path) == 123);
+    EXPECT(db2.size() == 18);
+    EXPECT(!db2.contains(ids[3]));
+    EXPECT(db2.contains(ids[0]));
+
+    const auto got = db2.search(q, 5);
+    ASSERT(got.size() == want.size());
+    for (size_t i = 0; i < got.size(); ++i) EXPECT(got[i] == want[i]);
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(snapshot_hnsw_preserves_graph) {
+    const std::string dir = fresh_wal_dir();
+    std::filesystem::create_directories(dir);
+    const std::string path = dir + "/snap";
+
+    VDBConfig cfg;
+    cfg.kind = IndexKind::HNSW;
+    cfg.dim = 8;
+    cfg.metric = Metric::L2;
+
+    auto gen = [](int i, int d) { return float((i * 31 + d * 7) % 97) * 0.1f; };
+    std::vector<float> q(8);
+    for (int d = 0; d < 8; ++d) q[d] = gen(3, d);
+
+    std::vector<ExternalId> ids;
+    std::vector<ExternalId> want;
+    {
+        VDB db(cfg);
+        for (int i = 0; i < 60; ++i) {
+            std::vector<float> v(8);
+            for (int d = 0; d < 8; ++d) v[d] = gen(i, d);
+            ids.push_back(db.insert(v.data()));
+        }
+        db.remove(ids[10]);
+        want = db.search(q.data(), 5);
+        save_snapshot(db, path, 7);
+    }
+
+    VDB db2(cfg);
+    EXPECT(load_snapshot(db2, path) == 7);
+    EXPECT(db2.size() == 59);
+
+    // The graph is restored byte-for-byte, so search returns identical results.
+    const auto got = db2.search(q.data(), 5);
+    ASSERT(got.size() == want.size());
+    for (size_t i = 0; i < got.size(); ++i) EXPECT(got[i] == want[i]);
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(snapshot_rejects_config_mismatch) {
+    const std::string dir = fresh_wal_dir();
+    std::filesystem::create_directories(dir);
+    const std::string path = dir + "/snap";
+
+    VDBConfig cfg;
+    cfg.kind = IndexKind::Brute;
+    cfg.dim = 3;
+    cfg.metric = Metric::L2;
+    {
+        VDB db(cfg);
+        const float v[3] = {1.0f, 2.0f, 3.0f};
+        db.insert(v);
+        save_snapshot(db, path, 1);
+    }
+
+    VDBConfig bad = cfg;
+    bad.dim = 4;
+    VDB db2(bad);
+    bool threw = false;
+    try {
+        load_snapshot(db2, path);
+    } catch (...) {
+        threw = true;
+    }
+    EXPECT(threw);
 
     std::filesystem::remove_all(dir);
 }

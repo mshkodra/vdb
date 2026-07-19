@@ -26,6 +26,9 @@ public:
     size_t size() const override;
     size_t dim() const override;
 
+    void serialize(std::vector<uint8_t>& out) const override;
+    void deserialize(Reader& r) override;
+
 private:
     IVFConfig   config_;
     DistanceFn  dist_fn_;

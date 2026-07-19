@@ -10,8 +10,7 @@
 
 namespace vdb {
 
-namespace {
-std::unique_ptr<Index> make_index(const VDBConfig& cfg, DistanceFn dist_fn) {
+std::unique_ptr<Index> VDB::make_index_(const VDBConfig& cfg, DistanceFn dist_fn) {
     switch (cfg.kind) {
         case IndexKind::Brute:
             return std::make_unique<BruteIndex>(cfg.dim, std::move(dist_fn));
@@ -26,10 +25,9 @@ std::unique_ptr<Index> make_index(const VDBConfig& cfg, DistanceFn dist_fn) {
     }
     return nullptr;
 }
-}
 
 VDB::VDB(VDBConfig cfg) : config_(cfg) {
-    index_ = make_index(config_, metric_fn(config_.metric));
+    index_ = make_index_(config_, metric_fn(config_.metric));
 }
 
 InternalId VDB::append_(ExternalId ext, const float* vec) {
@@ -111,7 +109,7 @@ void VDB::compact() {
     }
 
     // Fresh index and identity maps; external ids carry over unchanged.
-    index_ = make_index(config_, metric_fn(config_.metric));
+    index_ = make_index_(config_, metric_fn(config_.metric));
     ext_to_int_.clear();
     int_to_ext_.clear();
     deleted_.clear();
