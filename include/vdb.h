@@ -61,6 +61,10 @@ public:
     size_t deleted_count() const { return deleted_count_; } // outstanding tombstones
     size_t dim() const { return config_.dim; }
 
+    // The ExternalId the next insert() will mint. Lets a durable wrapper log an
+    // insert record before applying it.
+    ExternalId peek_next_id() const { return next_ext_id_; }
+
 private:
     VDBConfig              config_;
     std::unique_ptr<Index> index_;

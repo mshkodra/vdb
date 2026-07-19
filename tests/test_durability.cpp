@@ -2,6 +2,7 @@
 
 #include "crc32c.h"
 #include "distance.h"
+#include "durable_vdb.h"
 #include "snapshot.h"
 #include "vdb.h"
 #include "wal.h"
@@ -343,6 +344,108 @@ TEST(snapshot_rejects_config_mismatch) {
         threw = true;
     }
     EXPECT(threw);
+
+    std::filesystem::remove_all(dir);
+}
+
+// ---- DurableVDB (WAL + snapshots wired together) ----------------------------
+
+TEST(durable_round_trip_recovers_state) {
+    const std::string dir = fresh_wal_dir();
+    VDBConfig cfg;
+    cfg.kind = IndexKind::HNSW;
+    cfg.dim = 6;
+    cfg.metric = Metric::L2;
+    DurableVDB::Options opts;
+    opts.policy = DurableVDB::Policy::PerOpSync;
+
+    auto gen = [](int i, int d) { return float((i * 13 + d * 5) % 89) * 0.1f; };
+    std::vector<float> q(6);
+    for (int d = 0; d < 6; ++d) q[d] = gen(2, d);
+
+    std::vector<ExternalId> ids;
+    std::vector<ExternalId> want;
+    {
+        DurableVDB db(cfg, dir, opts);
+        for (int i = 0; i < 40; ++i) {
+            std::vector<float> v(6);
+            for (int d = 0; d < 6; ++d) v[d] = gen(i, d);
+            ids.push_back(db.insert(v.data()));
+        }
+        db.remove(ids[5]);
+        db.remove(ids[9]);
+        want = db.search(q.data(), 5);
+    }  // dropped without a clean checkpoint; PerOpSync leaves the WAL fully durable
+
+    DurableVDB db2(cfg, dir, opts);
+    EXPECT(db2.size() == 38);
+    EXPECT(!db2.contains(ids[5]));
+    EXPECT(db2.contains(ids[0]));
+
+    const auto got = db2.search(q.data(), 5);
+    ASSERT(got.size() == want.size());
+    for (size_t i = 0; i < got.size(); ++i) EXPECT(got[i] == want[i]);
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(durable_recovers_across_checkpoint) {
+    const std::string dir = fresh_wal_dir();
+    VDBConfig cfg;
+    cfg.kind = IndexKind::Brute;
+    cfg.dim = 4;
+    cfg.metric = Metric::L2;
+    DurableVDB::Options opts;
+    opts.policy = DurableVDB::Policy::PerOpSync;
+    opts.checkpoint_ops = 10;  // force checkpoints partway through
+
+    const float q[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    std::vector<ExternalId> ids;
+    std::vector<ExternalId> want;
+    {
+        DurableVDB db(cfg, dir, opts);
+        for (int i = 0; i < 25; ++i) {
+            const float v[4] = {float(i), float(i % 3), float(i % 7), float(i % 2)};
+            ids.push_back(db.insert(v));
+        }
+        db.remove(ids[2]);
+        want = db.search(q, 5);
+    }
+    EXPECT(std::filesystem::exists(dir + "/snapshot"));  // a checkpoint ran
+
+    DurableVDB db2(cfg, dir, opts);
+    EXPECT(db2.size() == 24);
+    EXPECT(!db2.contains(ids[2]));
+
+    const auto got = db2.search(q, 5);
+    ASSERT(got.size() == want.size());
+    for (size_t i = 0; i < got.size(); ++i) EXPECT(got[i] == want[i]);
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(durable_periodic_recovers_after_close) {
+    const std::string dir = fresh_wal_dir();
+    VDBConfig cfg;
+    cfg.kind = IndexKind::Brute;
+    cfg.dim = 3;
+    cfg.metric = Metric::L2;
+    DurableVDB::Options opts;
+    opts.policy = DurableVDB::Policy::Periodic;
+    opts.flush_interval_ms = 100000;  // never flush mid-run; only the destructor does
+
+    std::vector<ExternalId> ids;
+    {
+        DurableVDB db(cfg, dir, opts);
+        for (int i = 0; i < 5; ++i) {
+            const float v[3] = {float(i), 0.0f, 0.0f};
+            ids.push_back(db.insert(v));
+        }
+    }  // destructor flushes the deferred writes
+
+    DurableVDB db2(cfg, dir, opts);
+    EXPECT(db2.size() == 5);
+    EXPECT(db2.contains(ids[4]));
 
     std::filesystem::remove_all(dir);
 }
