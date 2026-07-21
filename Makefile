@@ -9,7 +9,7 @@ INCLUDE   := -Iinclude
 SRC_DIR   := src
 TEST_DIR  := tests
 BENCH_DIR := bench
-BUILD     := build
+BUILD     ?= build
 TEST_BLD  := $(BUILD)/tests
 BENCH_BLD := $(BUILD)/bench
 
@@ -29,7 +29,19 @@ LIB       := $(BUILD)/libvdb.a
 TEST_BIN  := $(BUILD)/run_tests
 BENCH_BIN := $(BUILD)/run_bench
 
-.PHONY: all clean test bench
+.PHONY: all clean test bench test-tsan test-asan
+
+# Sanitized test builds (Stage 7). Sanitizers must be present at both compile and
+# link, so they ride in CXXFLAGS (both rules use it). Each uses its own BUILD dir so
+# artifacts never mix with the -O2 build. -pthread is here because overriding
+# CXXFLAGS on the command line suppresses the makefile's own `+= -pthread`.
+SAN_CXXFLAGS := -std=c++17 -g -O1 -Wall -Wextra -Wpedantic -pthread -fno-omit-frame-pointer
+
+test-tsan:
+	$(MAKE) test BUILD=build-tsan CXXFLAGS="$(SAN_CXXFLAGS) -fsanitize=thread"
+
+test-asan:
+	$(MAKE) test BUILD=build-asan CXXFLAGS="$(SAN_CXXFLAGS) -fsanitize=address"
 
 all: $(LIB)
 
@@ -67,7 +79,7 @@ $(BENCH_BLD): | $(BUILD)
 	mkdir -p $@
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf build build-tsan build-asan
 
 -include $(DEPS)
 -include $(TEST_DEPS)
