@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +31,16 @@ struct VDBConfig {
 // expensive) but is excluded from results. compact() reclaims the dead space by
 // rebuilding the index from live vectors, remapping internal ids while keeping
 // every external id stable.
+//
+// Thread-safety (Stage 7). VDB is safe for many concurrent readers and writers.
+// `mu_` (a shared_mutex) guards the identity maps and parallel arrays: readers take
+// it shared, writers exclusive. A writer holds it exclusive only for two brief
+// phases — allocate (reserve the id, size the arrays) and publish (make the node
+// visible) — and does the expensive graph link *between* them with `mu_` released,
+// relying on the index's own per-node locks. So many inserts link in parallel and a
+// half-inserted node is never observed: allocate marks it deleted_=true (pending)
+// and publish flips it live. Concurrent mutations must target *distinct* external
+// ids (typical multi-writer partitioning); same-id races are not serialised here.
 class VDB {
 public:
     explicit VDB(VDBConfig cfg);
@@ -57,17 +69,28 @@ public:
     // External ids are preserved; internal ids are renumbered.
     void compact();
 
-    size_t size() const { return live_count_; }           // live vectors only
-    size_t deleted_count() const { return deleted_count_; } // outstanding tombstones
-    size_t dim() const { return config_.dim; }
+    size_t size() const {                                  // live vectors only
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return live_count_;
+    }
+    size_t deleted_count() const {                         // outstanding tombstones
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return deleted_count_;
+    }
+    size_t dim() const { return config_.dim; }             // immutable; no lock
 
     // The ExternalId the next insert() will mint. Lets a durable wrapper log an
-    // insert record before applying it.
+    // insert record before applying it. Not synchronised: the durable layer calls
+    // this inside its own serialised write path (Stage 6/7 step 3).
     ExternalId peek_next_id() const { return next_ext_id_; }
 
 private:
     VDBConfig              config_;
     std::unique_ptr<Index> index_;
+
+    // Guards the identity maps + parallel arrays below. mutable so the read paths
+    // (search/contains/size) can take it shared from const methods.
+    mutable std::shared_mutex mu_;
 
     // Identity maps. Internal ids index the parallel arrays below; they always
     // match the offsets the index hands back from add() (both append-only).
@@ -80,7 +103,9 @@ private:
     size_t     live_count_    = 0;
     size_t     deleted_count_ = 0;
 
-    // Append `vec` as a fresh internal node, keeping the parallel arrays in step.
+    // Append `vec` as a fresh *live* internal node (single-phase add), keeping the
+    // parallel arrays in step. Not synchronised — the caller must hold mu_ exclusive
+    // (or be single-threaded, as in compact()).
     InternalId append_(ExternalId ext, const float* vec);
 
     static std::unique_ptr<Index> make_index_(const VDBConfig& cfg, DistanceFn dist_fn);

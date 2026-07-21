@@ -38,6 +38,8 @@ public:
     HNSWIndex(HNSWConfig cfg, DistanceFn dist_fn);
 
     InternalId add(const float* vec) override;
+    InternalId allocate(const float* vec) override;  // serial: reserve slot + store vector
+    void       link(InternalId id) override;         // concurrent: wire into the graph
     std::vector<std::pair<InternalId, float>> search(const float* query,
                                                      size_t K) const override;
     size_t size() const override;

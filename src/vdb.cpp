@@ -43,14 +43,36 @@ InternalId VDB::append_(ExternalId ext, const float* vec) {
 }
 
 ExternalId VDB::insert(const float* vec) {
-    const ExternalId ext = next_ext_id_++;
-    const InternalId iid = append_(ext, vec);
-    ext_to_int_[ext] = iid;
-    ++live_count_;
+    ExternalId ext;
+    InternalId iid;
+    // Phase 1 (exclusive, brief): mint the id, reserve the node, size the arrays.
+    // The node is marked deleted_=true so it is invisible while it is being linked.
+    {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        ext = next_ext_id_++;
+        iid = index_->allocate(vec);
+        assert(iid == int_to_ext_.size());
+        int_to_ext_.push_back(ext);
+        deleted_.push_back(true);   // pending: invisible until publish
+        ++deleted_count_;
+        vectors_.emplace_back(vec, vec + config_.dim);
+    }
+    // Phase 2 (no lock): wire into the graph. Runs concurrently with other inserts'
+    // links and with searches, guarded by the index's own per-node locks.
+    index_->link(iid);
+    // Phase 3 (exclusive, brief): publish — the node becomes live and reachable.
+    {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        deleted_[iid] = false;
+        --deleted_count_;
+        ext_to_int_[ext] = iid;
+        ++live_count_;
+    }
     return ext;
 }
 
 bool VDB::remove(ExternalId id) {
+    std::unique_lock<std::shared_mutex> lk(mu_);
     auto it = ext_to_int_.find(id);
     if (it == ext_to_int_.end()) return false;
     deleted_[it->second] = true;   // tombstone; node stays in the graph
@@ -61,22 +83,48 @@ bool VDB::remove(ExternalId id) {
 }
 
 bool VDB::update(ExternalId id, const float* vec) {
-    auto it = ext_to_int_.find(id);
-    if (it == ext_to_int_.end()) return false;
-    // Tombstone the old node, insert a new one, and repoint the same external id.
-    // Live count is unchanged (one out, one in); one more tombstone is created.
-    deleted_[it->second] = true;
-    ++deleted_count_;
-    it->second = append_(id, vec);
+    InternalId new_iid, old_iid;
+    // Phase 1: allocate the replacement (pending). The old node stays live for now.
+    {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        auto it = ext_to_int_.find(id);
+        if (it == ext_to_int_.end()) return false;
+        old_iid = it->second;
+        new_iid = index_->allocate(vec);
+        assert(new_iid == int_to_ext_.size());
+        int_to_ext_.push_back(id);
+        deleted_.push_back(true);   // new node pending
+        ++deleted_count_;
+        vectors_.emplace_back(vec, vec + config_.dim);
+    }
+    // Phase 2 (no lock): link the replacement into the graph.
+    index_->link(new_iid);
+    // Phase 3: swap old→new atomically under one exclusive hold, so a concurrent
+    // reader sees the old vector or the new one, never neither. Live count is
+    // unchanged (one out, one in); a tombstone is left behind for the old node.
+    {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        deleted_[new_iid] = false; --deleted_count_;   // new goes live
+        deleted_[old_iid] = true;  ++deleted_count_;   // old becomes a tombstone
+        ext_to_int_[id] = new_iid;
+    }
     return true;
 }
 
 bool VDB::contains(ExternalId id) const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
     return ext_to_int_.find(id) != ext_to_int_.end();
 }
 
 std::vector<ExternalId> VDB::search(const float* query, size_t K) const {
     if (K == 0) return {};
+
+    // Shared lock held across the whole query: the index call is thread-safe on its
+    // own, but the results loop reads deleted_/int_to_ext_, which a writer's publish
+    // could grow. Holding shared throughout is the simple, correct choice; it does
+    // block writers' brief exclusive phases for the search duration — a later step
+    // can release mu_ across index_->search() and re-take it only for the loop.
+    std::shared_lock<std::shared_mutex> lk(mu_);
 
     // Tombstoned hits are dropped after the index returns them, so ask for enough
     // extra to still land K live results. K + deleted_count_ is exact for the
@@ -97,6 +145,7 @@ std::vector<ExternalId> VDB::search(const float* query, size_t K) const {
 }
 
 void VDB::compact() {
+    std::unique_lock<std::shared_mutex> lk(mu_);  // stop-the-world for the rebuild
     // Collect live vectors in internal-id order (deterministic rebuild).
     std::vector<std::vector<float>> live_vecs;
     std::vector<ExternalId>         live_exts;

@@ -212,10 +212,13 @@ void HNSWIndex::link_node_(InternalId id) {
     }
 }
 
+InternalId HNSWIndex::allocate(const float* vec) { return allocate_node_(vec).first; }
+
+void HNSWIndex::link(InternalId id) { link_node_(id); }
+
 InternalId HNSWIndex::add(const float* vec) {
-    auto [id, l] = allocate_node_(vec);
-    (void)l;
-    link_node_(id);
+    const InternalId id = allocate(vec);
+    link(id);
     return id;
 }
 

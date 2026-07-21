@@ -17,6 +17,14 @@ public:
 
     virtual InternalId add(const float* vec) = 0;
 
+    // Two-phase add for concurrent callers (Stage 7). allocate() reserves the node
+    // and stores the vector (serial: assigns the internal id); link() wires it into
+    // the structure and may run concurrently under the index's own fine-grained
+    // locks. The default is a single-phase add() + no-op link(), so brute/IVF — which
+    // have no cheap split and get coarse protection from the DB layer — need no change.
+    virtual InternalId allocate(const float* vec) { return add(vec); }
+    virtual void       link(InternalId /*id*/) {}
+
     virtual std::vector<std::pair<InternalId, float>> search(const float* query,
                                                              size_t K) const = 0;
 
