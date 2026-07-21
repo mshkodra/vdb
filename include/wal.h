@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,14 @@ DecodeStatus decode_record(const uint8_t* data, size_t avail,
 // Segment numbers increase forever; reclaim unlinks whole covered segments.
 //
 // Usage: open(), then replay() once, then append()/sync() and truncate().
+//
+// Thread-safety (Stage 7). append(), sync(), truncate(), and max_lsn() may run
+// concurrently. `io_mu_` guards the fd/segment metadata. sync() holds it only long
+// enough to dup() the active fd and read the high-water lsn, then fsyncs the *dup*
+// with the lock released — so an fsync (group commit) runs while other writers keep
+// appending. The dup is an independent fd to the same file, so a concurrent rotate
+// closing the original fd can't pull it out from under the fsync. replay()/open()
+// are single-threaded (used before concurrent operation begins).
 class Wal {
 public:
     struct Options {
@@ -78,12 +87,19 @@ public:
     void replay(const std::function<void(const WalRecord&)>& on_record);
 
     void append(const WalRecord& r);
-    void sync();  // fsync the active segment — the durability point
+
+    // fsync the log — the durability point. Returns the highest lsn now durable
+    // (the high-water at the moment the fsync began), so a group-commit caller can
+    // advance its durable_lsn for every writer the one fsync covered.
+    uint64_t sync();
 
     // Unlink sealed segments whose highest lsn <= upto_lsn.
     void truncate(uint64_t upto_lsn);
 
-    uint64_t max_lsn() const { return highest_lsn_; }
+    uint64_t max_lsn() const {
+        std::lock_guard<std::mutex> g(io_mu_);
+        return highest_lsn_;
+    }
 
 private:
     struct Segment {
@@ -103,6 +119,7 @@ private:
     void                  fsync_dir_();
     static void           sys_check(bool ok, const char* what);
 
+    mutable std::mutex   io_mu_;  // guards active_fd_/active_bytes_/segments_/highest_lsn_
     std::string          dir_;
     uint32_t             dim_     = 0;
     uint8_t              metric_  = 0;

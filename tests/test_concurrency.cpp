@@ -6,16 +6,21 @@
 
 #include "brute_index.h"
 #include "distance.h"
+#include "durable_vdb.h"
 #include "test.h"
 #include "vdb.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <filesystem>
 #include <random>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
+
+#include <unistd.h>
 
 using namespace vdb;
 
@@ -349,4 +354,110 @@ TEST(vdb_concurrent_insert_remove_disjoint) {
     }
     EXPECT(db.size() == live);
     EXPECT(db.deleted_count() == N - live);  // one tombstone per removed id
+}
+
+// ---- DurableVDB concurrency (Stage 7 step 3: serial prefix + group commit) ------
+
+namespace {
+
+std::string fresh_dir(const char* tag) {
+    static std::atomic<int> counter{0};
+    auto dir = std::filesystem::temp_directory_path() /
+               ("vdb_conc_" + std::string(tag) + "_" + std::to_string(::getpid()) + "_" +
+                std::to_string(counter.fetch_add(1)));
+    std::filesystem::remove_all(dir);
+    return dir.string();
+}
+
+}  // namespace
+
+// Concurrent durable writers (PerOpSync → group commit) plus readers, then reopen
+// from disk and confirm every insert survived. Proves the serial WAL prefix keeps
+// ext ids / lsns consistent under contention and that recovery rebuilds the full
+// state. A TSan/ASan target for the WAL's concurrent append+fsync.
+TEST(durable_concurrent_insert_and_recover) {
+    const size_t dim = 24, N = 3000, WT = 6, RT = 3;
+    auto data = gen(N, dim, 4242);
+    const std::string dir = fresh_dir("recover");
+
+    VDBConfig cfg = hnsw_vdb(dim);
+    DurableVDB::Options opts;
+    opts.policy         = DurableVDB::Policy::PerOpSync;  // exercise group commit
+    opts.checkpoint_ops = 1000000;                        // no auto-checkpoint here
+
+    std::vector<ExternalId> ids(N);
+    {
+        DurableVDB db(cfg, dir, opts);
+
+        std::atomic<size_t> next{0};
+        std::atomic<bool>   done{false};
+        auto writer = [&] {
+            size_t i;
+            while ((i = next.fetch_add(1)) < N) ids[i] = db.insert(&data[i * dim]);
+        };
+        auto reader = [&](unsigned seed) {
+            std::mt19937 rng(seed);
+            std::uniform_int_distribution<size_t> pick(0, N - 1);
+            while (!done.load(std::memory_order_relaxed))
+                (void)db.search(&data[pick(rng) * dim], 5);
+        };
+
+        std::vector<std::thread> writers, readers;
+        for (size_t t = 0; t < WT; ++t) writers.emplace_back(writer);
+        for (size_t t = 0; t < RT; ++t) readers.emplace_back(reader, 7000u + (unsigned)t);
+        for (auto& t : writers) t.join();
+        done.store(true, std::memory_order_relaxed);
+        for (auto& t : readers) t.join();
+
+        ASSERT(db.size() == N);
+    }  // destroyed → final fsync
+
+    // Reopen from disk: snapshot (none) + full WAL replay must restore everything.
+    {
+        DurableVDB db2(cfg, dir);
+        EXPECT(db2.size() == N);
+        std::unordered_set<ExternalId> distinct(ids.begin(), ids.end());
+        EXPECT(distinct.size() == N);
+        for (ExternalId e : ids) EXPECT(db2.contains(e));
+        size_t reachable = 0;
+        for (size_t i = 0; i < N; ++i)
+            if (!db2.search(&data[i * dim], 1).empty()) ++reachable;
+        EXPECT(reachable == N);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// Auto-checkpoint firing *during* concurrent writes must produce a consistent
+// snapshot (checkpoint quiesces in-flight applies), and reopening from
+// snapshot + WAL tail must recover the exact live set.
+TEST(durable_concurrent_checkpoint_and_recover) {
+    const size_t dim = 16, N = 4000, WT = 6;
+    auto data = gen(N, dim, 555);
+    const std::string dir = fresh_dir("ckpt");
+
+    VDBConfig cfg = hnsw_vdb(dim);
+    DurableVDB::Options opts;
+    opts.policy         = DurableVDB::Policy::PerOpSync;
+    opts.checkpoint_ops = 500;  // several checkpoints fire mid-run
+
+    std::vector<ExternalId> ids(N);
+    {
+        DurableVDB db(cfg, dir, opts);
+        std::atomic<size_t> next{0};
+        auto writer = [&] {
+            size_t i;
+            while ((i = next.fetch_add(1)) < N) ids[i] = db.insert(&data[i * dim]);
+        };
+        std::vector<std::thread> writers;
+        for (size_t t = 0; t < WT; ++t) writers.emplace_back(writer);
+        for (auto& t : writers) t.join();
+        ASSERT(db.size() == N);
+    }
+
+    {
+        DurableVDB db2(cfg, dir);
+        EXPECT(db2.size() == N);
+        for (ExternalId e : ids) EXPECT(db2.contains(e));
+    }
+    std::filesystem::remove_all(dir);
 }

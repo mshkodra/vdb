@@ -3,7 +3,6 @@
 #include "snapshot.h"
 
 #include <algorithm>
-#include <cassert>
 #include <filesystem>
 
 namespace vdb {
@@ -38,17 +37,16 @@ void DurableVDB::recover_() {
         if (r.lsn > snapshot_lsn) apply_(r);  // skip records already in the snapshot
     });
 
-    next_lsn_ = std::max(snapshot_lsn, wal_.max_lsn()) + 1;
+    next_lsn_    = std::max(snapshot_lsn, wal_.max_lsn()) + 1;
+    durable_lsn_ = next_lsn_ - 1;  // everything recovered from disk is durable
 }
 
 void DurableVDB::apply_(const WalRecord& r) {
     switch (r.type) {
-        case WalRecordType::Insert: {
-            const ExternalId got = db_.insert(r.vec.data());
-            assert(got == r.ext_id);
-            (void)got;
+        case WalRecordType::Insert:
+            // Replay uses the logged id directly, so the mapping is order-independent.
+            db_.insert_reserved(r.ext_id, r.vec.data());
             break;
-        }
         case WalRecordType::Update:
             db_.update(r.ext_id, r.vec.data());
             break;
@@ -60,64 +58,143 @@ void DurableVDB::apply_(const WalRecord& r) {
     }
 }
 
-void DurableVDB::log_(WalRecord&& r) {
-    wal_.append(r);
-    if (opts_.policy == Policy::PerOpSync) wal_.sync();  // durable before apply
+// Group commit: wait until `lsn` is on stable storage, batching the fsync across
+// concurrent writers. One thread becomes the leader and fsyncs once for everyone;
+// followers wait and wake when the leader has advanced durable_lsn_ past their lsn.
+// The fsync runs with commit_mutex_ released, so appends keep flowing into the batch.
+void DurableVDB::group_commit_(uint64_t lsn) {
+    std::unique_lock<std::mutex> lk(commit_mutex_);
+    while (durable_lsn_ < lsn) {
+        if (syncing_) {
+            commit_cv_.wait(lk);
+        } else {
+            syncing_ = true;
+            lk.unlock();
+            const uint64_t synced = wal_.sync();  // dup+fsync, concurrent with appends
+            lk.lock();
+            if (synced > durable_lsn_) durable_lsn_ = synced;
+            syncing_ = false;
+            commit_cv_.notify_all();
+        }
+    }
+}
+
+void DurableVDB::maybe_flush_() {
+    std::unique_lock<std::mutex> lk(commit_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    if (syncing_ || now - last_sync_ < std::chrono::milliseconds(opts_.flush_interval_ms))
+        return;
+    syncing_ = true;
+    lk.unlock();
+    const uint64_t synced = wal_.sync();
+    lk.lock();
+    if (synced > durable_lsn_) durable_lsn_ = synced;
+    last_sync_ = std::chrono::steady_clock::now();
+    syncing_   = false;
+    commit_cv_.notify_all();
+}
+
+void DurableVDB::finish_op_() {
+    std::lock_guard<std::mutex> g(commit_mutex_);
+    --in_flight_;
+    commit_cv_.notify_all();  // a checkpoint may be waiting for the count to hit 0
 }
 
 ExternalId DurableVDB::insert(const float* vec) {
-    const ExternalId id = db_.peek_next_id();
-    log_(WalRecord{WalRecordType::Insert, next_lsn_++, id,
-                   std::vector<float>(vec, vec + config_.dim)});
+    ExternalId ext;
+    uint64_t   lsn;
+    bool       do_ckpt = false;
+    // Serial prefix: reserve the id, assign the lsn, append the record — atomically,
+    // so WAL order == lsn order == ext-id order.
+    {
+        std::lock_guard<std::mutex> wg(write_mutex_);
+        ext = db_.reserve_id();
+        lsn = next_lsn_++;
+        wal_.append(WalRecord{WalRecordType::Insert, lsn, ext,
+                              std::vector<float>(vec, vec + config_.dim)});
+        {
+            std::lock_guard<std::mutex> cg(commit_mutex_);
+            ++in_flight_;
+        }
+        if (++ops_since_checkpoint_ >= opts_.checkpoint_ops) {
+            ops_since_checkpoint_ = 0;
+            do_ckpt               = true;  // this writer owns the checkpoint
+        }
+    }
 
-    const ExternalId got = db_.insert(vec);
-    assert(got == id);
-    (void)got;
+    if (opts_.policy == Policy::PerOpSync) group_commit_(lsn);  // durable before apply
+    db_.insert_reserved(ext, vec);                              // apply
+    if (opts_.policy == Policy::Periodic) maybe_flush_();       // relaxed: lazy fsync
 
-    ++ops_since_checkpoint_;
-    maybe_flush_();
-    maybe_checkpoint_();
-    return id;
+    finish_op_();
+    if (do_ckpt) checkpoint();
+    return ext;
 }
 
 bool DurableVDB::remove(ExternalId id) {
     if (!db_.contains(id)) return false;
-    log_(WalRecord{WalRecordType::Delete, next_lsn_++, id, {}});
-    db_.remove(id);
+    uint64_t lsn;
+    bool     do_ckpt = false;
+    {
+        std::lock_guard<std::mutex> wg(write_mutex_);
+        lsn = next_lsn_++;
+        wal_.append(WalRecord{WalRecordType::Delete, lsn, id, {}});
+        {
+            std::lock_guard<std::mutex> cg(commit_mutex_);
+            ++in_flight_;
+        }
+        if (++ops_since_checkpoint_ >= opts_.checkpoint_ops) {
+            ops_since_checkpoint_ = 0;
+            do_ckpt               = true;
+        }
+    }
 
-    ++ops_since_checkpoint_;
-    maybe_flush_();
-    maybe_checkpoint_();
+    if (opts_.policy == Policy::PerOpSync) group_commit_(lsn);
+    db_.remove(id);
+    if (opts_.policy == Policy::Periodic) maybe_flush_();
+
+    finish_op_();
+    if (do_ckpt) checkpoint();
     return true;
 }
 
 bool DurableVDB::update(ExternalId id, const float* vec) {
     if (!db_.contains(id)) return false;
-    log_(WalRecord{WalRecordType::Update, next_lsn_++, id,
-                   std::vector<float>(vec, vec + config_.dim)});
-    db_.update(id, vec);
+    uint64_t lsn;
+    bool     do_ckpt = false;
+    {
+        std::lock_guard<std::mutex> wg(write_mutex_);
+        lsn = next_lsn_++;
+        wal_.append(WalRecord{WalRecordType::Update, lsn, id,
+                              std::vector<float>(vec, vec + config_.dim)});
+        {
+            std::lock_guard<std::mutex> cg(commit_mutex_);
+            ++in_flight_;
+        }
+        if (++ops_since_checkpoint_ >= opts_.checkpoint_ops) {
+            ops_since_checkpoint_ = 0;
+            do_ckpt               = true;
+        }
+    }
 
-    ++ops_since_checkpoint_;
-    maybe_flush_();
-    maybe_checkpoint_();
+    if (opts_.policy == Policy::PerOpSync) group_commit_(lsn);
+    db_.update(id, vec);
+    if (opts_.policy == Policy::Periodic) maybe_flush_();
+
+    finish_op_();
+    if (do_ckpt) checkpoint();
     return true;
 }
 
-void DurableVDB::maybe_flush_() {
-    if (opts_.policy != Policy::Periodic) return;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last_sync_ >= std::chrono::milliseconds(opts_.flush_interval_ms)) {
-        wal_.sync();
-        last_sync_ = now;
-    }
-}
-
-void DurableVDB::maybe_checkpoint_() {
-    if (ops_since_checkpoint_ >= opts_.checkpoint_ops) checkpoint();
-}
-
 void DurableVDB::checkpoint() {
-    wal_.sync();
+    std::unique_lock<std::mutex> wg(write_mutex_);  // block new prefixes
+    // Wait for prefixed-but-unapplied ops to finish, so db_ is quiescent and the
+    // snapshot is a consistent point-in-time image.
+    {
+        std::unique_lock<std::mutex> cg(commit_mutex_);
+        commit_cv_.wait(cg, [&] { return in_flight_ == 0; });
+    }
+
     const uint64_t lsn = next_lsn_ - 1;  // highest lsn applied so far
 
     save_snapshot(db_, snapshot_path_, lsn);
@@ -125,12 +202,15 @@ void DurableVDB::checkpoint() {
     wal_.sync();
     wal_.truncate(lsn);
 
-    ops_since_checkpoint_ = 0;
-    last_sync_            = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> cg(commit_mutex_);
+    durable_lsn_ = std::max(durable_lsn_, lsn);
+    last_sync_   = std::chrono::steady_clock::now();
 }
 
 void DurableVDB::sync() {
-    wal_.sync();
+    const uint64_t synced = wal_.sync();
+    std::lock_guard<std::mutex> cg(commit_mutex_);
+    if (synced > durable_lsn_) durable_lsn_ = synced;
     last_sync_ = std::chrono::steady_clock::now();
 }
 

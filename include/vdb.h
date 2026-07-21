@@ -51,6 +51,14 @@ public:
     // Insert a new vector; returns its freshly minted, stable ExternalId.
     ExternalId insert(const float* vec);
 
+    // Two-step insert for the durable layer (Stage 7 step 3), so it can mint the id
+    // in its serialised WAL prefix and apply it after the fsync. reserve_id() hands
+    // out the next id; insert_reserved() runs the allocate→link→publish insert under
+    // that pre-assigned id (and keeps next_ext_id_ ahead of it, so the replay path —
+    // which calls insert_reserved directly with logged ids — stays consistent).
+    ExternalId reserve_id();
+    void       insert_reserved(ExternalId ext, const float* vec);
+
     // Tombstone the vector behind `id`. Returns false if `id` is unknown.
     bool remove(ExternalId id);
 

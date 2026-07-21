@@ -301,8 +301,10 @@ void Wal::replay(const std::function<void(const WalRecord&)>& on_record) {
 }
 
 void Wal::append(const WalRecord& r) {
+    const std::vector<uint8_t> frame = encode_record(r);  // pure; no shared state
+
+    std::lock_guard<std::mutex> g(io_mu_);
     sys_check(active_fd_ >= 0, "WAL not open");
-    const std::vector<uint8_t> frame = encode_record(r);
 
     // Seal-early rotate; the "has a record" guard avoids looping on an oversized one.
     if (active_bytes_ > kWalHeaderSize && active_bytes_ + frame.size() > seg_max_)
@@ -317,12 +319,30 @@ void Wal::append(const WalRecord& r) {
     if (r.lsn > highest_lsn_) highest_lsn_ = r.lsn;
 }
 
-void Wal::sync() {
-    sys_check(active_fd_ >= 0, "WAL not open");
-    sys_check(::fsync(active_fd_) == 0, "fsync WAL");
+uint64_t Wal::sync() {
+    // Capture the fd and high-water under the lock, then fsync the *dup* with the
+    // lock released so concurrent appends (and even a rotation closing the original
+    // fd) proceed. The dup is an independent fd to the same file; sealed segments
+    // were already fsync'd at rotation, so every record <= `target` is durable.
+    int      dupfd;
+    uint64_t target;
+    {
+        std::lock_guard<std::mutex> g(io_mu_);
+        sys_check(active_fd_ >= 0, "WAL not open");
+        dupfd = ::dup(active_fd_);
+        sys_check(dupfd >= 0, "dup WAL fd");
+        target = highest_lsn_;
+    }
+    const int rc    = ::fsync(dupfd);
+    const int saved = errno;
+    ::close(dupfd);
+    errno = saved;
+    sys_check(rc == 0, "fsync WAL");
+    return target;
 }
 
 void Wal::truncate(uint64_t upto_lsn) {
+    std::lock_guard<std::mutex> g(io_mu_);
     std::vector<Segment> survivors;
     survivors.reserve(segments_.size());
     bool removed = false;

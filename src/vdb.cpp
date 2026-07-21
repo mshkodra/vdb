@@ -42,20 +42,24 @@ InternalId VDB::append_(ExternalId ext, const float* vec) {
     return static_cast<InternalId>(int_to_ext_.size() - 1);
 }
 
-ExternalId VDB::insert(const float* vec) {
-    ExternalId ext;
+ExternalId VDB::reserve_id() {
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    return next_ext_id_++;
+}
+
+void VDB::insert_reserved(ExternalId ext, const float* vec) {
     InternalId iid;
-    // Phase 1 (exclusive, brief): mint the id, reserve the node, size the arrays.
-    // The node is marked deleted_=true so it is invisible while it is being linked.
+    // Phase 1 (exclusive, brief): reserve the node, size the arrays. The node is
+    // marked deleted_=true so it is invisible while it is being linked.
     {
         std::unique_lock<std::shared_mutex> lk(mu_);
-        ext = next_ext_id_++;
         iid = index_->allocate(vec);
         assert(iid == int_to_ext_.size());
         int_to_ext_.push_back(ext);
         deleted_.push_back(true);   // pending: invisible until publish
         ++deleted_count_;
         vectors_.emplace_back(vec, vec + config_.dim);
+        if (ext >= next_ext_id_) next_ext_id_ = ext + 1;  // keep ahead (replay path)
     }
     // Phase 2 (no lock): wire into the graph. Runs concurrently with other inserts'
     // links and with searches, guarded by the index's own per-node locks.
@@ -68,6 +72,11 @@ ExternalId VDB::insert(const float* vec) {
         ext_to_int_[ext] = iid;
         ++live_count_;
     }
+}
+
+ExternalId VDB::insert(const float* vec) {
+    const ExternalId ext = reserve_id();
+    insert_reserved(ext, vec);
     return ext;
 }
 
