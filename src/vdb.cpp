@@ -1,6 +1,7 @@
 #include "vdb.h"
 
 #include "brute_index.h"
+#include "distance.h"
 #include "hnsw_index.h"
 #include "ivf_index.h"
 
@@ -10,24 +11,44 @@
 
 namespace vdb {
 
-std::unique_ptr<Index> VDB::make_index_(const VDBConfig& cfg, DistanceFn dist_fn) {
+namespace {
+// Second half of the dispatch: given a chosen index template (Brute/IVF/HNSW), pick
+// the metric functor at runtime and build the matching instantiation. The metric is
+// erased behind the virtual Index* the moment we return, so this is the only place
+// the concrete IndexT<Dist> type is ever named — exactly what lets each index inline
+// its distance loop while callers still hold a plain Index*.
+template <template <class> class IndexT, class Arg>
+std::unique_ptr<Index> make_for_metric(Metric m, Arg&& arg) {
+    switch (m) {
+        case Metric::L2:
+            return std::make_unique<IndexT<L2>>(std::forward<Arg>(arg));
+        case Metric::InnerProduct:
+            return std::make_unique<IndexT<InnerProduct>>(std::forward<Arg>(arg));
+        case Metric::Cosine:
+            return std::make_unique<IndexT<Cosine>>(std::forward<Arg>(arg));
+    }
+    return nullptr;
+}
+}  // namespace
+
+std::unique_ptr<Index> VDB::make_index_(const VDBConfig& cfg) {
     switch (cfg.kind) {
         case IndexKind::Brute:
-            return std::make_unique<BruteIndex>(cfg.dim, std::move(dist_fn));
+            return make_for_metric<BruteIndex>(cfg.metric, cfg.dim);
         case IndexKind::IVF: {
             IVFConfig ivf; ivf.dim = cfg.dim;
-            return std::make_unique<IVFIndex>(ivf, std::move(dist_fn));
+            return make_for_metric<IVFIndex>(cfg.metric, ivf);
         }
         case IndexKind::HNSW: {
             HNSWConfig hnsw; hnsw.dim = cfg.dim;
-            return std::make_unique<HNSWIndex>(hnsw, std::move(dist_fn));
+            return make_for_metric<HNSWIndex>(cfg.metric, hnsw);
         }
     }
     return nullptr;
 }
 
 VDB::VDB(VDBConfig cfg) : config_(cfg) {
-    index_ = make_index_(config_, metric_fn(config_.metric));
+    index_ = make_index_(config_);
 }
 
 InternalId VDB::append_(ExternalId ext, const float* vec) {
@@ -167,7 +188,7 @@ void VDB::compact() {
     }
 
     // Fresh index and identity maps; external ids carry over unchanged.
-    index_ = make_index_(config_, metric_fn(config_.metric));
+    index_ = make_index_(config_);
     ext_to_int_.clear();
     int_to_ext_.clear();
     deleted_.clear();

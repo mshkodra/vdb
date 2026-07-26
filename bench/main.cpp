@@ -97,7 +97,7 @@ void bench_brute() {
         auto data = random_flat(N, dim, 1);
         auto queries = random_flat(Q, dim, 2);
 
-        vdb::BruteIndex idx(dim, vdb::metric_fn(vdb::Metric::L2));
+        vdb::BruteIndex<vdb::L2> idx(dim);
         for (size_t i = 0; i < N; ++i) idx.add(data.data() + i * dim);
 
         auto st = bench::measure([&] {
@@ -115,7 +115,7 @@ void bench_brute() {
 }
 
 std::vector<std::unordered_set<InternalId>> truth_sets(
-    const vdb::BruteIndex& oracle, const float* queries, size_t Q, size_t dim,
+    const vdb::BruteIndex<vdb::L2>& oracle, const float* queries, size_t Q, size_t dim,
     size_t K) {
     std::vector<std::unordered_set<InternalId>> truth(Q);
     for (size_t q = 0; q < Q; ++q) {
@@ -150,19 +150,18 @@ double us_per_query(const Index& idx, const float* queries, size_t Q, size_t dim
 
 void bench_ivf() {
     const size_t dim = 128, K = 10, Q = 100, iters = 25;
-    auto metric = vdb::metric_fn(vdb::Metric::L2);
 
     {
         const size_t N = 50000, nlist = static_cast<size_t>(std::sqrt((double)N));
         auto data = random_flat(N, dim, 1);
         auto queries = random_flat(Q, dim, 2);
 
-        vdb::BruteIndex oracle(dim, metric);
+        vdb::BruteIndex<vdb::L2> oracle(dim);
         for (size_t i = 0; i < N; ++i) oracle.add(data.data() + i * dim);
         auto truth = truth_sets(oracle, queries.data(), Q, dim, K);
         double brute_us = us_per_query(oracle, queries.data(), Q, dim, K);
 
-        vdb::IVFIndex ivf({dim, nlist, 8, iters}, metric);
+        vdb::IVFIndex<vdb::L2> ivf({dim, nlist, 8, iters});
         ivf.train(data.data(), N);
 
         std::printf("\n== IVF: nprobe sweep  (N=%zu, dim=%zu, nlist=%zu, K=%zu) ==\n",
@@ -184,7 +183,7 @@ void bench_ivf() {
         auto data = random_flat(N, dim, 1);
         auto queries = random_flat(Q, dim, 2);
 
-        vdb::BruteIndex oracle(dim, metric);
+        vdb::BruteIndex<vdb::L2> oracle(dim);
         for (size_t i = 0; i < N; ++i) oracle.add(data.data() + i * dim);
         auto truth = truth_sets(oracle, queries.data(), Q, dim, K);
 
@@ -193,7 +192,7 @@ void bench_ivf() {
         std::printf("%-8s %-12s %-10s %-14s %-12s\n",
                     "nlist", "probe%", "recall", "us/query(min)", "QPS");
         for (size_t nlist : {64u, 128u, 256u, 512u}) {
-            vdb::IVFIndex ivf({dim, nlist, nprobe, iters}, metric);
+            vdb::IVFIndex<vdb::L2> ivf({dim, nlist, nprobe, iters});
             ivf.train(data.data(), N);
             double rec = recall_at_k(ivf, truth, queries.data(), Q, dim, K);
             double us = us_per_query(ivf, queries.data(), Q, dim, K);
@@ -213,12 +212,12 @@ void bench_ivf() {
             auto data = random_flat(N, dim, 1);
             auto queries = random_flat(Q, dim, 2);
 
-            vdb::BruteIndex oracle(dim, metric);
+            vdb::BruteIndex<vdb::L2> oracle(dim);
             for (size_t i = 0; i < N; ++i) oracle.add(data.data() + i * dim);
             auto truth = truth_sets(oracle, queries.data(), Q, dim, K);
             double brute_us = us_per_query(oracle, queries.data(), Q, dim, K);
 
-            vdb::IVFIndex ivf({dim, nlist, nprobe, iters}, metric);
+            vdb::IVFIndex<vdb::L2> ivf({dim, nlist, nprobe, iters});
             ivf.train(data.data(), N);
             double rec = recall_at_k(ivf, truth, queries.data(), Q, dim, K);
             double us = us_per_query(ivf, queries.data(), Q, dim, K);
@@ -238,12 +237,12 @@ void bench_ivf() {
             auto data = random_flat(N, d, 1);
             auto queries = random_flat(Q, d, 2);
 
-            vdb::BruteIndex oracle(d, metric);
+            vdb::BruteIndex<vdb::L2> oracle(d);
             for (size_t i = 0; i < N; ++i) oracle.add(data.data() + i * d);
             auto truth = truth_sets(oracle, queries.data(), Q, d, K);
             double brute_us = us_per_query(oracle, queries.data(), Q, d, K);
 
-            vdb::IVFIndex ivf({d, nlist, nprobe, iters}, metric);
+            vdb::IVFIndex<vdb::L2> ivf({d, nlist, nprobe, iters});
             ivf.train(data.data(), N);
             double rec = recall_at_k(ivf, truth, queries.data(), Q, d, K);
             double us = us_per_query(ivf, queries.data(), Q, d, K);
@@ -258,16 +257,15 @@ void bench_ivf_clustered() {
     const size_t nlist = static_cast<size_t>(std::sqrt((double)N));
     const size_t nc = 100;
     const float spread = 0.10f;
-    auto metric = vdb::metric_fn(vdb::Metric::L2);
 
     auto data = clustered_flat(N, dim, nc, spread, 1);
     auto queries = clustered_flat(Q, dim, nc, spread, 2);
 
-    vdb::BruteIndex oracle(dim, metric);
+    vdb::BruteIndex<vdb::L2> oracle(dim);
     for (size_t i = 0; i < N; ++i) oracle.add(data.data() + i * dim);
     auto truth = truth_sets(oracle, queries.data(), Q, dim, K);
 
-    vdb::IVFIndex ivf({dim, nlist, 8, iters}, metric);
+    vdb::IVFIndex<vdb::L2> ivf({dim, nlist, 8, iters});
     ivf.train(data.data(), N);
 
     std::printf("\n== IVF: nprobe sweep on CLUSTERED data "
@@ -285,12 +283,11 @@ void bench_ivf_clustered() {
 void bench_hnsw() {
     const size_t N = 10000, dim = 128, K = 10, Q = 100;
     const size_t M = 16;
-    auto metric = vdb::metric_fn(vdb::Metric::L2);
 
     auto data = random_flat(N, dim, 1);
     auto queries = random_flat(Q, dim, 2);
 
-    vdb::BruteIndex oracle(dim, metric);
+    vdb::BruteIndex<vdb::L2> oracle(dim);
     for (size_t i = 0; i < N; ++i) oracle.add(data.data() + i * dim);
     auto truth = truth_sets(oracle, queries.data(), Q, dim, K);
     double brute_us = us_per_query(oracle, queries.data(), Q, dim, K);
@@ -301,7 +298,7 @@ void bench_hnsw() {
     std::printf("%-8s %-10s %-14s %-12s %-10s\n",
                 "ef", "recall", "us/query(min)", "QPS", "speedup");
     for (size_t ef : {10u, 20u, 40u, 80u, 160u}) {
-        vdb::HNSWIndex hnsw({dim, M, M, 2 * M, ef, 0.0f}, metric);
+        vdb::HNSWIndex<vdb::L2> hnsw({dim, M, M, 2 * M, ef, 0.0f});
         for (size_t i = 0; i < N; ++i) hnsw.add(data.data() + i * dim);
         double rec = recall_at_k(hnsw, truth, queries.data(), Q, dim, K);
         double us = us_per_query(hnsw, queries.data(), Q, dim, K);

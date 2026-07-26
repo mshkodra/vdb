@@ -2,25 +2,29 @@
 #include <algorithm>
 #include <utility>
 
+#include "distance.h"
+
 namespace vdb {
 
-BruteIndex::BruteIndex(size_t dim, DistanceFn dist_fn)
-    : dim_(dim), dist_fn_(std::move(dist_fn)) {}
+template <class Dist>
+BruteIndex<Dist>::BruteIndex(size_t dim) : dim_(dim) {}
 
-InternalId BruteIndex::add(const float* vec) {
+template <class Dist>
+InternalId BruteIndex<Dist>::add(const float* vec) {
     data_.emplace_back(vec, vec + dim_);
     return data_.size() - 1;
 }
 
-std::vector<std::pair<InternalId, float>> BruteIndex::search(const float* query,
-                                                             size_t K) const {
+template <class Dist>
+std::vector<std::pair<InternalId, float>> BruteIndex<Dist>::search(const float* query,
+                                                                   size_t K) const {
     using Entry = std::pair<InternalId, float>;
 
     std::vector<Entry> all;
     all.reserve(data_.size());
     for (size_t i = 0; i < data_.size(); ++i)
         all.push_back({static_cast<InternalId>(i),
-                       dist_fn_(query, data_[i].data(), dim_)});
+                       dist_(query, data_[i].data(), dim_)});
 
     auto by_distance = [](const Entry& a, const Entry& b) {
         return a.second < b.second;
@@ -35,20 +39,32 @@ std::vector<std::pair<InternalId, float>> BruteIndex::search(const float* query,
     return all;
 }
 
-size_t BruteIndex::size() const { return data_.size(); }
-size_t BruteIndex::dim() const { return dim_; }
+template <class Dist>
+size_t BruteIndex<Dist>::size() const { return data_.size(); }
 
-void BruteIndex::serialize(std::vector<uint8_t>& out) const {
+template <class Dist>
+size_t BruteIndex<Dist>::dim() const { return dim_; }
+
+template <class Dist>
+void BruteIndex<Dist>::serialize(std::vector<uint8_t>& out) const {
     put<uint64_t>(out, dim_);
     put<uint64_t>(out, data_.size());
     for (const auto& v : data_) put_floats(out, v);
 }
 
-void BruteIndex::deserialize(Reader& r) {
+template <class Dist>
+void BruteIndex<Dist>::deserialize(Reader& r) {
     dim_ = r.get<uint64_t>();
     const uint64_t n = r.get<uint64_t>();
     data_.resize(n);
     for (uint64_t i = 0; i < n; ++i) data_[i] = r.get_floats();
 }
+
+// One materialized index type per metric functor. The definitions above are only
+// instantiated here, so they stay in this .cpp (header/impl split preserved) while
+// still inlining each functor's loop into the search hot path.
+template class BruteIndex<L2>;
+template class BruteIndex<InnerProduct>;
+template class BruteIndex<Cosine>;
 
 }

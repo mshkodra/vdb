@@ -127,7 +127,7 @@ uint64_t load_snapshot(VDB& db, const std::string& path) {
     for (InternalId i = 0; i < db.int_to_ext_.size(); ++i)
         if (!db.deleted_[i]) db.ext_to_int_[db.int_to_ext_[i]] = i;
 
-    db.index_ = VDB::make_index_(db.config_, metric_fn(db.config_.metric));
+    db.index_ = VDB::make_index_(db.config_);
     db.index_->deserialize(r);
 
     return lsn;

@@ -12,9 +12,10 @@ struct IVFConfig {
     size_t kmeans_iters = 25;
 };
 
+template <class Dist>
 class IVFIndex : public Index {
 public:
-    IVFIndex(IVFConfig cfg, DistanceFn dist_fn);
+    explicit IVFIndex(IVFConfig cfg);
 
     void train(const float* data, size_t n) override;
 
@@ -31,7 +32,7 @@ public:
 
 private:
     IVFConfig   config_;
-    DistanceFn  dist_fn_;
+    Dist        dist_;
     bool        trained_ = false;
 
     std::vector<std::vector<float>>             centroids_;

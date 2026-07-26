@@ -9,10 +9,13 @@
 #include <utility>
 #include <unordered_set>
 
+#include "distance.h"
+
 namespace vdb {
 
-HNSWIndex::HNSWIndex(HNSWConfig cfg, DistanceFn dist_fn)
-    : config_(cfg), dist_fn_(std::move(dist_fn)), rng_(cfg.seed) {
+template <class Dist>
+HNSWIndex<Dist>::HNSWIndex(HNSWConfig cfg)
+    : config_(cfg), rng_(cfg.seed) {
     if (config_.mL <= 0.0f) {
         config_.mL = 1.0f / std::log(static_cast<float>(config_.M));
     }
@@ -22,18 +25,20 @@ HNSWIndex::HNSWIndex(HNSWConfig cfg, DistanceFn dist_fn)
     nodes_.reserve(config_.max_elements);
 }
 
-int HNSWIndex::sample_layer_() const {
+template <class Dist>
+int HNSWIndex<Dist>::sample_layer_() const {
     std::uniform_real_distribution<double> u(0.0, 1.0);
     double r = -std::log(1.0 - u(rng_)) * config_.mL;
     return static_cast<int>(r);
 }
 
-InternalId HNSWIndex::closest_(const float* q,
-                               const std::vector<InternalId>& cands) const {
-    float      best_dist = dist_fn_(q, nodes_[cands[0]].data.data(), config_.dim);
+template <class Dist>
+InternalId HNSWIndex<Dist>::closest_(const float* q,
+                                     const std::vector<InternalId>& cands) const {
+    float      best_dist = dist_(q, nodes_[cands[0]].data.data(), config_.dim);
     InternalId best_id   = cands[0];
     for (size_t i = 1; i < cands.size(); ++i) {
-        const float d = dist_fn_(q, nodes_[cands[i]].data.data(), config_.dim);
+        const float d = dist_(q, nodes_[cands[i]].data.data(), config_.dim);
         if (d < best_dist) {
             best_dist = d;
             best_id   = cands[i];
@@ -42,8 +47,9 @@ InternalId HNSWIndex::closest_(const float* q,
     return best_id;
 }
 
-std::vector<InternalId> HNSWIndex::search_layer(const float* q, InternalId ep,
-                                                size_t ef, int layer_number) const {
+template <class Dist>
+std::vector<InternalId> HNSWIndex<Dist>::search_layer(const float* q, InternalId ep,
+                                                      size_t ef, int layer_number) const {
     using DI = std::pair<float, InternalId>;  // (distance to q, node id)
 
     std::unordered_set<InternalId> visited{ep};
@@ -52,7 +58,7 @@ std::vector<InternalId> HNSWIndex::search_layer(const float* q, InternalId ep,
     // W: max-heap on distance (current worst result on top, so we can evict it).
     std::priority_queue<DI> W;
 
-    const float d_ep = dist_fn_(q, nodes_[ep].data.data(), config_.dim);
+    const float d_ep = dist_(q, nodes_[ep].data.data(), config_.dim);
     candidates.emplace(d_ep, ep);
     W.emplace(d_ep, ep);
 
@@ -75,7 +81,7 @@ std::vector<InternalId> HNSWIndex::search_layer(const float* q, InternalId ep,
         for (InternalId id : nbrs) {
             if (!visited.insert(id).second) continue;
 
-            const float d = dist_fn_(q, nodes_[id].data.data(), config_.dim);
+            const float d = dist_(q, nodes_[id].data.data(), config_.dim);
             if (W.size() < ef || d < W.top().first) {
                 candidates.emplace(d, id);
                 W.emplace(d, id);
@@ -98,15 +104,16 @@ std::vector<InternalId> HNSWIndex::search_layer(const float* q, InternalId ep,
 // piling them onto the M nearest (which, in a tight cluster, all point inward and
 // leave the cluster poorly bridged). keepPrunedConnections tops the result back up
 // to M from the discarded set so connectivity is preserved.
-std::vector<InternalId> HNSWIndex::select_neighbors(const float* q,
-                                                    std::vector<InternalId> cands,
-                                                    size_t M) const {
+template <class Dist>
+std::vector<InternalId> HNSWIndex<Dist>::select_neighbors(const float* q,
+                                                          std::vector<InternalId> cands,
+                                                          size_t M) const {
     if (cands.size() <= M) return cands;
 
     // Process candidates nearest-to-q first.
     std::sort(cands.begin(), cands.end(), [&](InternalId a, InternalId b) {
-        return dist_fn_(q, nodes_[a].data.data(), config_.dim) <
-               dist_fn_(q, nodes_[b].data.data(), config_.dim);
+        return dist_(q, nodes_[a].data.data(), config_.dim) <
+               dist_(q, nodes_[b].data.data(), config_.dim);
     });
 
     std::vector<InternalId> result;
@@ -114,10 +121,10 @@ std::vector<InternalId> HNSWIndex::select_neighbors(const float* q,
     result.reserve(M);
     for (InternalId e : cands) {
         if (result.size() >= M) break;
-        const float d_eq = dist_fn_(q, nodes_[e].data.data(), config_.dim);
+        const float d_eq = dist_(q, nodes_[e].data.data(), config_.dim);
         bool closer_to_q = true;
         for (InternalId r : result) {
-            const float d_er = dist_fn_(nodes_[e].data.data(),
+            const float d_er = dist_(nodes_[e].data.data(),
                                         nodes_[r].data.data(), config_.dim);
             if (d_er < d_eq) {  // e sits nearer an existing neighbour than to q
                 closer_to_q = false;
@@ -134,7 +141,8 @@ std::vector<InternalId> HNSWIndex::select_neighbors(const float* q,
     return result;
 }
 
-std::pair<InternalId, int> HNSWIndex::allocate_node_(const float* vec) {
+template <class Dist>
+std::pair<InternalId, int> HNSWIndex<Dist>::allocate_node_(const float* vec) {
     std::lock_guard<std::mutex> g(grow_mutex_);
     if (nodes_.size() >= config_.max_elements)
         throw std::length_error("HNSWIndex: max_elements exceeded");
@@ -151,7 +159,8 @@ std::pair<InternalId, int> HNSWIndex::allocate_node_(const float* vec) {
     return {id, l};
 }
 
-void HNSWIndex::link_node_(InternalId id) {
+template <class Dist>
+void HNSWIndex<Dist>::link_node_(InternalId id) {
     const float* vec = nodes_[id].data.data();          // stable, immutable
     const int    l   = static_cast<int>(nodes_[id].neighbours.size()) - 1;
 
@@ -212,18 +221,22 @@ void HNSWIndex::link_node_(InternalId id) {
     }
 }
 
-InternalId HNSWIndex::allocate(const float* vec) { return allocate_node_(vec).first; }
+template <class Dist>
+InternalId HNSWIndex<Dist>::allocate(const float* vec) { return allocate_node_(vec).first; }
 
-void HNSWIndex::link(InternalId id) { link_node_(id); }
+template <class Dist>
+void HNSWIndex<Dist>::link(InternalId id) { link_node_(id); }
 
-InternalId HNSWIndex::add(const float* vec) {
+template <class Dist>
+InternalId HNSWIndex<Dist>::add(const float* vec) {
     const InternalId id = allocate(vec);
     link(id);
     return id;
 }
 
-std::vector<std::pair<InternalId, float>> HNSWIndex::search(const float* query,
-                                                            size_t K) const {
+template <class Dist>
+std::vector<std::pair<InternalId, float>> HNSWIndex<Dist>::search(const float* query,
+                                                                 size_t K) const {
     InternalId ep;
     int        L;
     {
@@ -243,7 +256,7 @@ std::vector<std::pair<InternalId, float>> HNSWIndex::search(const float* query,
     std::vector<std::pair<InternalId, float>> results;
     results.reserve(W.size());
     for (InternalId id : W) {
-        results.emplace_back(id, dist_fn_(query, nodes_[id].data.data(), config_.dim));
+        results.emplace_back(id, dist_(query, nodes_[id].data.data(), config_.dim));
     }
     std::sort(results.begin(), results.end(),
               [](const auto& a, const auto& b) { return a.second < b.second; });
@@ -251,14 +264,17 @@ std::vector<std::pair<InternalId, float>> HNSWIndex::search(const float* query,
     return results;
 }
 
-size_t HNSWIndex::size() const {
+template <class Dist>
+size_t HNSWIndex<Dist>::size() const {
     std::lock_guard<std::mutex> g(grow_mutex_);
     return nodes_.size();
 }
 
-size_t HNSWIndex::dim() const { return config_.dim; }
+template <class Dist>
+size_t HNSWIndex<Dist>::dim() const { return config_.dim; }
 
-void HNSWIndex::serialize(std::vector<uint8_t>& out) const {
+template <class Dist>
+void HNSWIndex<Dist>::serialize(std::vector<uint8_t>& out) const {
     put<uint32_t>(out, entry_point_);
     put<int32_t>(out, max_layer_);
     put<uint64_t>(out, ef_search_);
@@ -273,7 +289,8 @@ void HNSWIndex::serialize(std::vector<uint8_t>& out) const {
     }
 }
 
-void HNSWIndex::deserialize(Reader& r) {
+template <class Dist>
+void HNSWIndex<Dist>::deserialize(Reader& r) {
     entry_point_     = r.get<uint32_t>();
     max_layer_       = r.get<int32_t>();
     ef_search_       = r.get<uint64_t>();
@@ -297,5 +314,10 @@ void HNSWIndex::deserialize(Reader& r) {
         node.lock = std::make_unique<std::mutex>();
     }
 }
+
+// One materialized index type per metric functor (see brute_index.cpp).
+template class HNSWIndex<L2>;
+template class HNSWIndex<InnerProduct>;
+template class HNSWIndex<Cosine>;
 
 }

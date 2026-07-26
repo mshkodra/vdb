@@ -1,6 +1,7 @@
 #include "test.h"
 
 #include "brute_index.h"
+#include "distance.h"
 
 #include <cmath>
 
@@ -10,21 +11,10 @@ bool near(float a, float b, float eps = 1e-4f) {
     return std::fabs(a - b) <= eps;
 }
 
-DistanceFn l2sq() {
-    return [](const float* a, const float* b, size_t d) {
-        float s = 0.0f;
-        for (size_t i = 0; i < d; ++i) {
-            float x = a[i] - b[i];
-            s += x * x;
-        }
-        return s;
-    };
-}
-
 }
 
 TEST(brute_empty_index) {
-    vdb::BruteIndex idx(4, l2sq());
+    vdb::BruteIndex<vdb::L2> idx(4);
     EXPECT(idx.dim() == 4);
     EXPECT(idx.size() == 0);
     float q[] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -32,7 +22,7 @@ TEST(brute_empty_index) {
 }
 
 TEST(brute_add_returns_sequential_ids) {
-    vdb::BruteIndex idx(2, l2sq());
+    vdb::BruteIndex<vdb::L2> idx(2);
     float a[] = {0.0f, 0.0f};
     float b[] = {1.0f, 1.0f};
     float c[] = {2.0f, 2.0f};
@@ -43,8 +33,8 @@ TEST(brute_add_returns_sequential_ids) {
 }
 
 namespace {
-vdb::BruteIndex fixture() {
-    vdb::BruteIndex idx(2, l2sq());
+vdb::BruteIndex<vdb::L2> fixture() {
+    vdb::BruteIndex<vdb::L2> idx(2);
     float p0[] = {0.0f, 0.0f};
     float p1[] = {1.0f, 0.0f};
     float p2[] = {0.0f, 2.0f};

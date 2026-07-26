@@ -116,7 +116,7 @@ private:
     // (or be single-threaded, as in compact()).
     InternalId append_(ExternalId ext, const float* vec);
 
-    static std::unique_ptr<Index> make_index_(const VDBConfig& cfg, DistanceFn dist_fn);
+    static std::unique_ptr<Index> make_index_(const VDBConfig& cfg);
 };
 
 }

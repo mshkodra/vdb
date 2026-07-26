@@ -33,9 +33,10 @@ struct HNSWConfig {
 //   - `entry_mutex_` guards the entry point and max layer.
 // At most one node lock is ever held at a time, so the graph edit is deadlock-free
 // without a lock-ordering rule.
+template <class Dist>
 class HNSWIndex : public Index {
 public:
-    HNSWIndex(HNSWConfig cfg, DistanceFn dist_fn);
+    explicit HNSWIndex(HNSWConfig cfg);
 
     InternalId add(const float* vec) override;
     InternalId allocate(const float* vec) override;  // serial: reserve slot + store vector
@@ -58,7 +59,7 @@ private:
     };
 
     HNSWConfig  config_;
-    DistanceFn  dist_fn_;
+    Dist        dist_;
     InternalId  entry_point_ = 0;
     int         max_layer_   = -1;
     size_t      ef_search_   = 50;

@@ -3,6 +3,13 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
 # pthreads is linked ahead of Stage 7 (concurrency), where the test suite will
 # spin up reader/writer threads. Harmless before then.
 CXXFLAGS += -pthread
+# Distance metrics are templated functors inlined into each index (no std::function
+# on the hot path), so the compiler can see the L2/IP loop at the call site.
+# -ffast-math lets it treat FP addition as associative and vectorize the distance
+# reduction; -march=native emits the widest SIMD this host supports. NOTE: -ffast-math
+# changes distance values in the low bits, which can flip tie-breaks between
+# near-equidistant neighbours — re-baseline recall numbers after this change.
+CXXFLAGS += -ffast-math -march=native
 AR       ?= ar
 
 INCLUDE   := -Iinclude

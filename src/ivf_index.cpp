@@ -8,16 +8,19 @@
 #include <random>
 #include <utility>
 
+#include "distance.h"
+
 namespace vdb {
 
-IVFIndex::IVFIndex(IVFConfig cfg, DistanceFn dist_fn)
-    : config_(cfg), dist_fn_(std::move(dist_fn)) {}
+template <class Dist>
+IVFIndex<Dist>::IVFIndex(IVFConfig cfg) : config_(cfg) {}
 
-int IVFIndex::nearest_centroid(const float* v) const {
+template <class Dist>
+int IVFIndex<Dist>::nearest_centroid(const float* v) const {
     int best = -1;
     float best_dist = std::numeric_limits<float>::max();
     for (size_t c = 0; c < centroids_.size(); ++c) {
-        float d = dist_fn_(v, centroids_[c].data(), config_.dim);
+        float d = dist_(v, centroids_[c].data(), config_.dim);
         if (d < best_dist) {
             best_dist = d;
             best = static_cast<int>(c);
@@ -26,7 +29,8 @@ int IVFIndex::nearest_centroid(const float* v) const {
     return best;
 }
 
-void IVFIndex::train(const float* data, size_t n) {
+template <class Dist>
+void IVFIndex<Dist>::train(const float* data, size_t n) {
     const size_t dim = config_.dim;
 
     const size_t nlist = std::min(config_.nlist, n);
@@ -76,7 +80,8 @@ void IVFIndex::train(const float* data, size_t n) {
     trained_ = true;
 }
 
-InternalId IVFIndex::add(const float* vec) {
+template <class Dist>
+InternalId IVFIndex<Dist>::add(const float* vec) {
     assert(trained_ && "IVFIndex::add called before train()");
 
     InternalId id = static_cast<InternalId>(vectors_.size());
@@ -87,15 +92,16 @@ InternalId IVFIndex::add(const float* vec) {
     return id;
 }
 
-std::vector<std::pair<InternalId, float>> IVFIndex::search(const float* query,
-                                                           size_t K) const {
+template <class Dist>
+std::vector<std::pair<InternalId, float>> IVFIndex<Dist>::search(const float* query,
+                                                                size_t K) const {
     assert(trained_ && "IVFIndex::search called before train()");
     if (K == 0 || centroids_.empty()) return {};
 
     std::vector<std::pair<float, size_t>> cd;
     cd.reserve(centroids_.size());
     for (size_t c = 0; c < centroids_.size(); ++c) {
-        cd.emplace_back(dist_fn_(query, centroids_[c].data(), config_.dim), c);
+        cd.emplace_back(dist_(query, centroids_[c].data(), config_.dim), c);
     }
     size_t probe = std::min(config_.nprobe, cd.size());
     std::nth_element(cd.begin(), cd.begin() + probe, cd.end());
@@ -104,7 +110,7 @@ std::vector<std::pair<InternalId, float>> IVFIndex::search(const float* query,
     for (size_t p = 0; p < probe; ++p) {
         size_t c = cd[p].second;
         for (InternalId id : inverted_lists_[c]) {
-            float d = dist_fn_(query, vectors_[id].data(), config_.dim);
+            float d = dist_(query, vectors_[id].data(), config_.dim);
             if (heap.size() < K) {
                 heap.emplace(d, id);
             } else if (d < heap.top().first) {
@@ -122,10 +128,14 @@ std::vector<std::pair<InternalId, float>> IVFIndex::search(const float* query,
     return result;
 }
 
-size_t IVFIndex::size() const { return vectors_.size(); }
-size_t IVFIndex::dim() const { return config_.dim; }
+template <class Dist>
+size_t IVFIndex<Dist>::size() const { return vectors_.size(); }
 
-void IVFIndex::serialize(std::vector<uint8_t>& out) const {
+template <class Dist>
+size_t IVFIndex<Dist>::dim() const { return config_.dim; }
+
+template <class Dist>
+void IVFIndex<Dist>::serialize(std::vector<uint8_t>& out) const {
     put<uint8_t>(out, trained_ ? 1 : 0);
     put<uint64_t>(out, config_.nlist);
     put<uint64_t>(out, config_.nprobe);
@@ -140,7 +150,8 @@ void IVFIndex::serialize(std::vector<uint8_t>& out) const {
     for (const auto& v : vectors_) put_floats(out, v);
 }
 
-void IVFIndex::deserialize(Reader& r) {
+template <class Dist>
+void IVFIndex<Dist>::deserialize(Reader& r) {
     trained_       = r.get<uint8_t>() != 0;
     config_.nlist  = r.get<uint64_t>();
     config_.nprobe = r.get<uint64_t>();
@@ -158,5 +169,10 @@ void IVFIndex::deserialize(Reader& r) {
     vectors_.resize(nv);
     for (uint64_t i = 0; i < nv; ++i) vectors_[i] = r.get_floats();
 }
+
+// One materialized index type per metric functor (see brute_index.cpp).
+template class IVFIndex<L2>;
+template class IVFIndex<InnerProduct>;
+template class IVFIndex<Cosine>;
 
 }

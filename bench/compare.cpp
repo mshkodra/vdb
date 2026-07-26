@@ -78,7 +78,7 @@ std::vector<float> clustered_flat(size_t n, size_t dim, size_t nc, float spread,
 // ---- evaluation helpers -----------------------------------------------------
 
 std::vector<std::unordered_set<InternalId>> truth_sets(
-    const vdb::BruteIndex& oracle, const float* queries, size_t dim) {
+    const vdb::BruteIndex<vdb::L2>& oracle, const float* queries, size_t dim) {
     std::vector<std::unordered_set<InternalId>> truth(Q);
     for (size_t q = 0; q < Q; ++q)
         for (auto& [id, d] : oracle.search(queries + q * dim, K))
@@ -175,14 +175,13 @@ double build_ms_of(const std::function<void()>& build) {
 
 void run_dataset(const char* name, const std::vector<float>& data,
                  const std::vector<float>& queries, std::vector<Row>& out) {
-    auto metric = vdb::metric_fn(vdb::Metric::L2);
     const size_t nlist = static_cast<size_t>(std::sqrt((double)N));
 
     std::printf("\n===== dataset: %s  (N=%zu, dim=%zu, K=%zu, Q=%zu) =====\n",
                 name, N, DIM, K, Q);
 
     // Brute oracle: also the ground truth and the recall=1.0 frontier point.
-    vdb::BruteIndex oracle(DIM, metric);
+    vdb::BruteIndex<vdb::L2> oracle(DIM);
     double brute_build = build_ms_of([&] {
         for (size_t i = 0; i < N; ++i) oracle.add(data.data() + i * DIM);
     });
@@ -200,7 +199,7 @@ void run_dataset(const char* name, const std::vector<float>& data,
         // NOTE: this IVFIndex::train() also populates the inverted lists with all
         // N vectors, so it is the full build. Do NOT also call add() here or every
         // vector is inserted twice (duplicate ids -> recall caps near 0.5).
-        vdb::IVFIndex ivf({DIM, nlist, IVF_NPROBE.front(), IVF_KMEANS_ITERS}, metric);
+        vdb::IVFIndex<vdb::L2> ivf({DIM, nlist, IVF_NPROBE.front(), IVF_KMEANS_ITERS});
         double build = build_ms_of([&] { ivf.train(data.data(), N); });
         std::printf("  IVF   : build %.1f ms (nlist=%zu)\n", build, nlist);
         for (size_t np : IVF_NPROBE) {
@@ -216,8 +215,8 @@ void run_dataset(const char* name, const std::vector<float>& data,
 
     // HNSW: one built graph, sweep ef (pure search-time knob).
     {
-        vdb::HNSWIndex hnsw(
-            {DIM, HNSW_M, HNSW_M, 2 * HNSW_M, HNSW_EF_CONSTRUCTION, 0.0f}, metric);
+        vdb::HNSWIndex<vdb::L2> hnsw(
+            {DIM, HNSW_M, HNSW_M, 2 * HNSW_M, HNSW_EF_CONSTRUCTION, 0.0f});
         double build = build_ms_of([&] {
             for (size_t i = 0; i < N; ++i) hnsw.add(data.data() + i * DIM);
         });
@@ -241,11 +240,10 @@ void run_dataset(const char* name, const std::vector<float>& data,
 void run_seed_study() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     const size_t n = 4000, dim = 128, M = 32, efc = 100, ef_search = 160;
-    auto metric = vdb::metric_fn(vdb::Metric::L2);
     auto data = clustered_flat(n, dim, CLUSTERS, SPREAD, 1);
     auto queries = clustered_flat(Q, dim, CLUSTERS, SPREAD, 2);
 
-    vdb::BruteIndex oracle(dim, metric);
+    vdb::BruteIndex<vdb::L2> oracle(dim);
     for (size_t i = 0; i < n; ++i) oracle.add(data.data() + i * dim);
     auto truth = truth_sets(oracle, queries.data(), dim);
 
@@ -254,7 +252,7 @@ void run_seed_study() {
     double sum = 0, mn = 1e9, mx = 0;
     const unsigned seeds = 6;
     for (unsigned s = 1; s <= seeds; ++s) {
-        vdb::HNSWIndex h({dim, M, M, 2 * M, efc, 0.0f, s}, metric);
+        vdb::HNSWIndex<vdb::L2> h({dim, M, M, 2 * M, efc, 0.0f, s});
         for (size_t i = 0; i < n; ++i) h.add(data.data() + i * dim);
         h.set_ef_search(ef_search);
         double rec = recall_at_k(h, truth, queries.data(), dim);

@@ -5,9 +5,10 @@
 
 namespace vdb {
 
+template <class Dist>
 class BruteIndex : public Index {
 public:
-    BruteIndex(size_t dim, DistanceFn dist_fn);
+    explicit BruteIndex(size_t dim);
 
     InternalId add(const float* vec) override;
     std::vector<std::pair<InternalId, float>> search(const float* query,
@@ -20,7 +21,7 @@ public:
 
 private:
     size_t                          dim_;
-    DistanceFn                      dist_fn_;
+    Dist                            dist_;
     std::vector<std::vector<float>> data_;
 };
 

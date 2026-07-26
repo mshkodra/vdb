@@ -1,43 +1,19 @@
 #include "distance.h"
-#include <iostream>
+
 namespace vdb {
 
+// The free functions delegate to the functors so the loop lives in exactly one place
+// (the header). They are only used off the hot path, so the extra call is harmless.
 float l2_squared(const float* a, const float* b, size_t dim) {
-    float total = 0;
-    for(size_t i = 0; i < dim; i++) {
-        float diff = a[i] - b[i];
-        total += (diff * diff);
-    }
-    return total;
+    return L2{}(a, b, dim);
 }
 
 float neg_inner_product(const float* a, const float* b, size_t dim) {
-    float total = 0;
-    for(size_t i = 0; i < dim; i++)
-        total += (a[i] * b[i]);
-    return -1 * total;
+    return InnerProduct{}(a, b, dim);
 }
 
 float cosine_distance(const float* a, const float* b, size_t dim) {
-    auto isZero = [](const float* a, size_t dim) {
-        for(size_t i = 0; i < dim; i++) {
-            if(a[i] != 0) return false;
-        }
-        return true;
-    };
-    if(isZero(a, dim) || isZero(b, dim)) {
-        std::cout << "Error\n Division by Zero";
-        return 0;
-    }
-
-    auto norm = [](const float* a, size_t dim) {
-        float total = 0;
-        for(size_t i = 0; i < dim; i++) total += (a[i] * a[i]);
-        return sqrtf(total);
-    };
-    float num = neg_inner_product(a, b, dim) / (norm(a, dim) * norm(b, dim));
-
-    return 1 + num;
+    return Cosine{}(a, b, dim);
 }
 
 DistanceFn metric_fn(Metric m) {

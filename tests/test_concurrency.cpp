@@ -57,7 +57,7 @@ double recall_by_distance(std::vector<float> truth, std::vector<float> got, size
 
 // Build an HNSW index over `data` (N x dim) using T threads pulling work items off
 // a shared atomic counter.
-void build_concurrent(HNSWIndex& h, const std::vector<float>& data, size_t N,
+void build_concurrent(HNSWIndex<L2>& h, const std::vector<float>& data, size_t N,
                       size_t dim, size_t T) {
     std::atomic<size_t> next{0};
     auto worker = [&] {
@@ -79,7 +79,7 @@ TEST(add_returns_sequential_ids_serial) {
     HNSWConfig cfg;
     cfg.dim          = dim;
     cfg.max_elements = N;
-    HNSWIndex h(cfg, metric_fn(Metric::L2));
+    HNSWIndex<L2> h(cfg);
     for (size_t i = 0; i < N; ++i) {
         InternalId id = h.add(&data[i * dim]);
         EXPECT(id == static_cast<InternalId>(i));
@@ -93,7 +93,7 @@ TEST(max_elements_is_enforced) {
     HNSWConfig cfg;
     cfg.dim          = 4;
     cfg.max_elements = 3;
-    HNSWIndex h(cfg, metric_fn(Metric::L2));
+    HNSWIndex<L2> h(cfg);
     float v[4] = {1, 2, 3, 4};
     h.add(v);
     h.add(v);
@@ -119,7 +119,7 @@ TEST(concurrent_add_all_present) {
     cfg.M            = 16;
     cfg.ef           = 100;
     cfg.max_elements = N;
-    HNSWIndex h(cfg, metric_fn(Metric::L2));
+    HNSWIndex<L2> h(cfg);
     h.set_ef_search(64);
 
     build_concurrent(h, data, N, dim, T);
@@ -143,7 +143,7 @@ TEST(concurrent_recall_matches_serial) {
     auto queries = gen(Q, dim, 99);
 
     // Exact oracle.
-    BruteIndex brute(dim, metric_fn(Metric::L2));
+    BruteIndex<L2> brute(dim);
     for (size_t i = 0; i < N; ++i) brute.add(&data[i * dim]);
 
     HNSWConfig cfg;
@@ -153,12 +153,12 @@ TEST(concurrent_recall_matches_serial) {
     cfg.max_elements = N;
 
     // Serial reference build.
-    HNSWIndex serial(cfg, metric_fn(Metric::L2));
+    HNSWIndex<L2> serial(cfg);
     serial.set_ef_search(100);
     for (size_t i = 0; i < N; ++i) serial.add(&data[i * dim]);
 
     // Concurrent build (same config, scrambled insert order).
-    HNSWIndex concurrent(cfg, metric_fn(Metric::L2));
+    HNSWIndex<L2> concurrent(cfg);
     concurrent.set_ef_search(100);
     build_concurrent(concurrent, data, N, dim, T);
 
@@ -198,7 +198,7 @@ TEST(concurrent_search_during_add) {
     cfg.M            = 16;
     cfg.ef           = 100;
     cfg.max_elements = N;
-    HNSWIndex h(cfg, metric_fn(Metric::L2));
+    HNSWIndex<L2> h(cfg);
     h.set_ef_search(50);
 
     std::atomic<size_t> next{0};
