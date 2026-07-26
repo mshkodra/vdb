@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <unordered_set>
@@ -328,6 +329,11 @@ int main(int argc, char** argv) {
         run_sift(argc > 2 ? argv[2] : "data/sift",
                  argc > 3 ? argv[3] : "all",
                  argc > 4 ? argv[4] : "");
+        return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "sift-mt") {
+        run_sift_mt(argc > 2 ? argv[2] : "data/sift",
+                    argc > 3 ? std::atoi(argv[3]) : 8);
         return 0;
     }
     std::printf("vdb Stage 1 benchmarks — compare MIN columns across versions\n");

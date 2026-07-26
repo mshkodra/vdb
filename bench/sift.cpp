@@ -10,6 +10,7 @@
 #include <sys/stat.h>  // mkdir for the snapshot cache dir
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -417,4 +419,95 @@ void run_sift(const char* data_dir, const char* methods, const char* label_arg) 
 
     write_csv(rows, csv_path, variant, append);
     std::printf("plot with:  python3 docs/plot_sift.py %s\n", csv_path.c_str());
+}
+
+// ---- multithreaded query throughput -----------------------------------------
+// Load the cached HNSW graph and drive concurrent searches from T threads to
+// measure aggregate QPS and how it scales 1 -> max_threads. Searches are const
+// and the graph is immutable here (read-only workload), so this exercises the
+// Stage-7 read path: whether per-node locks taken while copying neighbour lists
+// let reads scale, or whether hot nodes (the entry point, upper layers — visited
+// by *every* query) become contended locks.
+void run_sift_mt(const char* data_dir, int max_threads) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    const std::string dir = data_dir;
+
+    // N from the base file's size — needed to validate the cache header, without
+    // paying to load the 512 MB of vectors (the snapshot already holds them).
+    size_t n_base = 0;
+    {
+        std::ifstream f(dir + "/sift_base.fvecs", std::ios::binary | std::ios::ate);
+        if (!f) { std::fprintf(stderr, "!! cannot open %s/sift_base.fvecs\n",
+                               dir.c_str()); return; }
+        n_base = static_cast<size_t>(f.tellg()) / (4 + DIM * 4);
+    }
+
+    size_t n_query = 0, n_gt = 0, gt_dim = 0;
+    auto queries = read_fvecs(dir + "/sift_query.fvecs", n_query);
+    auto gt      = read_ivecs(dir + "/sift_groundtruth.ivecs", n_gt, gt_dim);
+
+    vdb::HNSWIndex<vdb::L2> hnsw({DIM, HNSW_M, HNSW_M, 2 * HNSW_M, HNSW_EFC, 0.0f});
+    const std::string cache = dir + "/cache/hnsw.snap";
+    const std::vector<uint64_t> params = {DIM, n_base, HNSW_M, HNSW_EFC};
+    double build_ms = 0.0;
+    if (!load_index_snapshot(cache, params, hnsw, build_ms)) {
+        std::printf("!! no cached HNSW at %s\n"
+                    "   build it first:  ./build/run_bench sift %s hnsw\n",
+                    cache.c_str(), dir.c_str());
+        return;
+    }
+
+    std::printf("\n######## SIFT1M multithreaded HNSW throughput ########\n");
+    std::printf("loaded graph (N=%zu, M=%zu, efC=%zu) | hw_concurrency=%u | "
+                "max_threads=%d\n", n_base, HNSW_M, HNSW_EFC,
+                std::thread::hardware_concurrency(), max_threads);
+
+    const size_t K = 10;
+    const std::vector<size_t> EFS = {64, 128};
+    const std::vector<int> THREADS = {1, 2, 4, 8, 16};
+
+    for (size_t ef : EFS) {
+        hnsw.set_ef_search(ef);
+        double rec = recall_at_k(hnsw, gt.data(), gt_dim, queries.data(),
+                                 std::min<size_t>(2000, n_query), K);
+        std::printf("\n== ef=%zu  (recall@%zu %.3f, K=%zu) ==\n", ef, K, rec, K);
+        std::printf("%-8s %-14s %-14s %-9s %-8s\n",
+                    "threads", "QPS", "QPS/thread", "scaling", "effic.");
+        std::printf("%-8s %-14s %-14s %-9s %-8s\n",
+                    "-------", "---", "----------", "-------", "------");
+
+        double base_qps = 0.0;
+        for (int T : THREADS) {
+            if (T > max_threads) break;
+
+            double best_qps = 0.0;
+            for (int rep = 0; rep < 3; ++rep) {  // take the best (warmest) of 3
+                std::atomic<bool> go{false};
+                std::vector<std::thread> pool;
+                pool.reserve(T);
+                const float* q = queries.data();
+                const size_t Q = n_query;
+                for (int t = 0; t < T; ++t) {
+                    pool.emplace_back([&] {
+                        while (!go.load(std::memory_order_acquire)) {}  // start together
+                        size_t h = 0;
+                        for (size_t i = 0; i < Q; ++i)
+                            h += hnsw.search(q + i * DIM, K).size();
+                        bench::do_not_optimize(h);
+                    });
+                }
+                auto t0 = bench::clk::now();
+                go.store(true, std::memory_order_release);
+                for (auto& th : pool) th.join();
+                auto t1 = bench::clk::now();
+                double secs = std::chrono::duration<double>(t1 - t0).count();
+                best_qps = std::max(best_qps, static_cast<double>(T) * Q / secs);
+            }
+
+            if (T == 1) base_qps = best_qps;
+            const double scaling = best_qps / base_qps;
+            std::printf("%-8d %-14.0f %-14.0f %-9.2f %-7.0f%%\n",
+                        T, best_qps, best_qps / T, scaling, 100.0 * scaling / T);
+        }
+    }
 }

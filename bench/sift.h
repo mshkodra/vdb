@@ -11,3 +11,7 @@
 // IVF/HNSW builds are cached to <data_dir>/cache/*.snap and loaded in seconds on
 // re-run; brute (trivial) always rebuilds.
 void run_sift(const char* data_dir, const char* methods, const char* label);
+
+// `run_bench sift-mt [data_dir] [max_threads]`. Loads the cached HNSW graph and
+// measures aggregate query QPS scaling from 1 to max_threads (default 8).
+void run_sift_mt(const char* data_dir, int max_threads);
