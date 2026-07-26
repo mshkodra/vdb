@@ -1,6 +1,7 @@
 #include "bench.h"
 #include "compare.h"
 #include "concurrency.h"
+#include "sift.h"
 
 #include "brute_index.h"
 #include "distance.h"
@@ -324,6 +325,10 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && std::string(argv[1]) == "concurrency") {
         run_concurrency();
+        return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "sift") {
+        run_sift(argc > 2 ? argv[2] : "data/sift", argc > 3 ? argv[3] : "all");
         return 0;
     }
     std::printf("vdb Stage 1 benchmarks — compare MIN columns across versions\n");
