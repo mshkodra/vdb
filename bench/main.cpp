@@ -325,7 +325,9 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (argc > 1 && std::string(argv[1]) == "sift") {
-        run_sift(argc > 2 ? argv[2] : "data/sift", argc > 3 ? argv[3] : "all");
+        run_sift(argc > 2 ? argv[2] : "data/sift",
+                 argc > 3 ? argv[3] : "all",
+                 argc > 4 ? argv[4] : "");
         return 0;
     }
     std::printf("vdb Stage 1 benchmarks — compare MIN columns across versions\n");

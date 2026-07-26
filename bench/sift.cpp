@@ -7,6 +7,8 @@
 #include "hnsw_index.h"
 #include "ivf_index.h"
 
+#include <sys/stat.h>  // mkdir for the snapshot cache dir
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -14,10 +16,14 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+#include "serialize.h"  // put<>/Reader — index snapshots reuse these primitives
 
 namespace {
 
@@ -43,17 +49,21 @@ constexpr size_t HNSW_EFC = 200;  // efConstruction (build-time candidate width)
 const std::vector<size_t> HNSW_EF_K10  = {10, 16, 32, 64, 128, 256};
 const std::vector<size_t> HNSW_EF_K100 = {100, 128, 200, 320, 512, 800};
 
-// IVF. nlist ~ sqrt(N) ~= 1000; nprobe is the recall/speed knob.
+// IVF. nlist ~ sqrt(N) ~= 1000; nprobe is the recall/speed knob. nprobe=256 was
+// dropped: at a quarter of all cells it collapses to ~brute cost for a sliver of
+// recall, and its recall pass over the query set dominated re-run time.
 constexpr size_t IVF_NLIST        = 1024;
 constexpr size_t IVF_KMEANS_ITERS = 15;
-const std::vector<size_t> IVF_NPROBE = {1, 4, 8, 16, 32, 64, 128, 256};
+const std::vector<size_t> IVF_NPROBE = {1, 4, 8, 16, 32, 64, 128};
 
 // Recall Ks reported for every method (ground truth ships top-100).
 const std::vector<size_t> RECALL_K = {10, 100};
 
-// Evaluation budget. Recall is averaged over the full query set (the canonical
-// SIFT number); latency is measured on a subset with min-of-reps to cut noise.
-constexpr size_t Q_RECALL   = 10000;  // full SIFT query set
+// Evaluation budget. Recall is a per-query average, so a 2k-query subset is a
+// statistically stable estimate (±<0.01) at a fraction of the cost — the full
+// 10k pass at high nprobe was the re-run bottleneck. Latency uses its own subset
+// with min-of-reps to cut noise.
+constexpr size_t Q_RECALL   = 2000;   // subset for recall (stable average)
 constexpr size_t Q_TIMING   = 1000;   // subset for latency/QPS
 constexpr int    TIMING_REPS = 5;
 // Brute at N=1M is ~tens of ms/query; anchor it on a small query subset only.
@@ -61,7 +71,60 @@ constexpr size_t Q_BRUTE    = 200;
 constexpr int    BRUTE_REPS = 3;
 // ============================================================================
 
-const char* const CSV_PATH = "docs/results/sift1m.csv";
+// ---- index snapshot cache ---------------------------------------------------
+// Serialize the *finished* IVF/HNSW structure so a re-run loads it in seconds
+// instead of re-training/re-building for ~20 min. This is snapshot, not WAL:
+// replaying a WAL of 1M INSERTs would just redo the build. A small header carries
+// the build params; a mismatch (or a --rebuild) forces a fresh build. The build
+// time is stored too, so cached runs still report the true build cost.
+
+constexpr uint32_t CACHE_MAGIC   = 0x53494654;  // "SIFT"
+constexpr uint32_t CACHE_VERSION = 1;
+
+void save_index_snapshot(const std::string& path, double build_ms,
+                         const std::vector<uint64_t>& params,
+                         const vdb::Index& idx) {
+    std::vector<uint8_t> buf;
+    vdb::put<uint32_t>(buf, CACHE_MAGIC);
+    vdb::put<uint32_t>(buf, CACHE_VERSION);
+    vdb::put<double>(buf, build_ms);
+    vdb::put<uint32_t>(buf, static_cast<uint32_t>(params.size()));
+    for (uint64_t p : params) vdb::put<uint64_t>(buf, p);
+    idx.serialize(buf);
+
+    const std::string tmp = path + ".tmp";
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) { std::printf("  !! cannot write cache %s\n", tmp.c_str()); return; }
+    f.write(reinterpret_cast<const char*>(buf.data()),
+            static_cast<std::streamsize>(buf.size()));
+    f.close();
+    std::rename(tmp.c_str(), path.c_str());  // replace atomically
+}
+
+// Returns true iff the file exists, header + params match, and deserialize
+// succeeds; on any mismatch/corruption returns false so the caller rebuilds.
+bool load_index_snapshot(const std::string& path,
+                         const std::vector<uint64_t>& params, vdb::Index& idx,
+                         double& build_ms_out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+    vdb::Reader r(buf.data(), buf.size());
+    try {
+        if (r.get<uint32_t>() != CACHE_MAGIC)   return false;
+        if (r.get<uint32_t>() != CACHE_VERSION) return false;
+        build_ms_out = r.get<double>();
+        if (r.get<uint32_t>() != params.size()) return false;
+        for (uint64_t exp : params)
+            if (r.get<uint64_t>() != exp) return false;
+        idx.deserialize(r);
+    } catch (const std::exception& e) {
+        std::printf("  !! cache load failed (%s) — rebuilding\n", e.what());
+        return false;
+    }
+    return true;
+}
 
 // ---- .fvecs / .ivecs readers ------------------------------------------------
 // Format: each record is [int32 dim][dim payload]. No file header, no count;
@@ -161,7 +224,9 @@ QStats time_queries(const Index& idx, const float* queries, size_t Q, size_t K,
 
     std::vector<double> per_us(Q);
     for (size_t q = 0; q < Q; ++q) {
-        double best = std::numeric_limits<double>::infinity();
+        // Finite sentinel, not infinity(): -ffast-math implies -ffinite-math-only,
+        // which makes infinities UB and lets the compiler miscompile this min.
+        double best = std::numeric_limits<double>::max();
         for (int r = 0; r < reps; ++r) {
             auto t0 = bench::clk::now();
             auto res = idx.search(queries + q * DIM, K);
@@ -195,36 +260,55 @@ struct Row {
     double      build_ms, recall, qps, mean_us, p50_us, p95_us, p99_us;
 };
 
-void write_csv(const std::vector<Row>& rows, bool append) {
-    std::FILE* f = std::fopen(CSV_PATH, append ? "a" : "w");
+void write_csv(const std::vector<Row>& rows, const std::string& path,
+               const std::string& variant, bool append) {
+    std::FILE* f = std::fopen(path.c_str(), append ? "a" : "w");
     if (!f) {
-        std::printf("!! could not open %s (mkdir -p docs/results first)\n", CSV_PATH);
+        std::printf("!! could not open %s (mkdir -p docs/results first)\n", path.c_str());
         return;
     }
     if (!append)
         std::fprintf(f, "dataset,method,k,knob,knob_val,build_ms,recall,qps,"
-                        "mean_us,p50_us,p95_us,p99_us\n");
+                        "mean_us,p50_us,p95_us,p99_us,variant\n");
     for (const auto& r : rows)
-        std::fprintf(f, "sift1m,%s,%ld,%s,%ld,%.1f,%.4f,%.1f,%.3f,%.3f,%.3f,%.3f\n",
+        std::fprintf(f, "sift1m,%s,%ld,%s,%ld,%.1f,%.4f,%.1f,%.3f,%.3f,%.3f,%.3f,%s\n",
                      r.method.c_str(), r.k, r.knob.c_str(), r.knob_val, r.build_ms,
-                     r.recall, r.qps, r.mean_us, r.p50_us, r.p95_us, r.p99_us);
+                     r.recall, r.qps, r.mean_us, r.p50_us, r.p95_us, r.p99_us,
+                     variant.c_str());
     std::fclose(f);
-    std::printf("\nwrote %zu rows -> %s\n", rows.size(), CSV_PATH);
+    std::printf("\nwrote %zu rows -> %s  (variant=%s)\n",
+                rows.size(), path.c_str(), variant.c_str());
 }
 
 }  // namespace
 
-void run_sift(const char* data_dir, const char* methods) {
+void run_sift(const char* data_dir, const char* methods, const char* label_arg) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // live progress even when piped
     const std::string dir = data_dir;
     const std::string which = methods ? methods : "all";
-    // A subset run appends to the CSV so brute/IVF/HNSW can be resumed
-    // independently (e.g. after a crash mid-build) without re-paying builds.
-    const bool run_all = (which == "all");
+    // `which` is "all" or a comma list of {brute,ivf,hnsw}, optionally with the
+    // token "rebuild" to bypass the snapshot cache and force a fresh build.
+    const bool run_all       = which.find("all") != std::string::npos;
+    const bool force_rebuild = which.find("rebuild") != std::string::npos;
     auto want = [&](const char* m) {
         return run_all || which.find(m) != std::string::npos;
     };
-    auto metric = vdb::metric_fn(vdb::Metric::L2);
+    // A subset run appends to the CSV so methods can be filled in independently.
+    const bool append = !run_all;
+
+    // `label` tags a run so before/after variants live in separate CSVs and carry
+    // a `variant` column (e.g. "stdfn" vs "inlined"). Empty label => default file.
+    const std::string label   = (label_arg && *label_arg) ? label_arg : "";
+    const std::string variant = label.empty() ? "run" : label;
+    const std::string csv_path = label.empty()
+        ? std::string("docs/results/sift1m.csv")
+        : "docs/results/sift1m_" + label + ".csv";
+
+    const std::string cache_dir = dir + "/cache";
+    ::mkdir(cache_dir.c_str(), 0755);  // ignore EEXIST
+
+    // Indexes are templated on the distance functor (vdb::L2) so the inner loop
+    // inlines and auto-vectorizes — no std::function on the hot path.
 
     std::printf("\n######## SIFT1M: recall-vs-QPS on real data ########\n");
     std::printf("loading from %s ...\n", dir.c_str());
@@ -244,7 +328,7 @@ void run_sift(const char* data_dir, const char* methods) {
     // ---- brute anchor: recall ~1.0 (validates gt alignment + metric), and the
     //      QPS floor every ANN curve is measured against. Timed on a subset. ----
     if (want("brute")) {
-        vdb::BruteIndex brute(DIM, metric);
+        vdb::BruteIndex<vdb::L2> brute(DIM);
         double build = build_ms_of([&] {
             for (size_t i = 0; i < n_base; ++i) brute.add(base.data() + i * DIM);
         });
@@ -262,11 +346,21 @@ void run_sift(const char* data_dir, const char* methods) {
 
     // ---- IVF: one trained index (k-means over all 1M), sweep nprobe. ----
     if (want("ivf")) {
-        vdb::IVFIndex ivf({DIM, IVF_NLIST, IVF_NPROBE.front(), IVF_KMEANS_ITERS}, metric);
-        std::printf("\n[IVF]  training (nlist=%zu, iters=%zu) over %zu vectors — "
-                    "this is the slow one...\n", IVF_NLIST, IVF_KMEANS_ITERS, n_base);
-        double build = build_ms_of([&] { ivf.train(base.data(), n_base); });
-        std::printf("  build %.0f ms\n", build);
+        vdb::IVFIndex<vdb::L2> ivf({DIM, IVF_NLIST, IVF_NPROBE.front(), IVF_KMEANS_ITERS});
+        const std::string cache = cache_dir + "/ivf.snap";
+        const std::vector<uint64_t> params = {DIM, n_base, IVF_NLIST, IVF_KMEANS_ITERS};
+        double build = 0.0;
+        if (!force_rebuild && load_index_snapshot(cache, params, ivf, build)) {
+            std::printf("\n[IVF]  loaded cache %s (nlist=%zu, orig build %.0f ms)\n",
+                        cache.c_str(), IVF_NLIST, build);
+        } else {
+            std::printf("\n[IVF]  training (nlist=%zu, iters=%zu) over %zu vectors — "
+                        "this is the slow one...\n", IVF_NLIST, IVF_KMEANS_ITERS, n_base);
+            build = build_ms_of([&] { ivf.train(base.data(), n_base); });
+            std::printf("  build %.0f ms\n", build);
+            save_index_snapshot(cache, build, params, ivf);
+            std::printf("  cached -> %s\n", cache.c_str());
+        }
         for (size_t np : IVF_NPROBE) {
             ivf.set_nprobe(np);
             for (size_t K : RECALL_K) {
@@ -282,18 +376,28 @@ void run_sift(const char* data_dir, const char* methods) {
 
     // ---- HNSW: one built graph, separate ef sweep per K (width = max(ef,K)). ----
     if (want("hnsw")) {
-        vdb::HNSWIndex hnsw(
-            {DIM, HNSW_M, HNSW_M, 2 * HNSW_M, HNSW_EFC, 0.0f}, metric);
-        std::printf("\n[HNSW]  building (M=%zu, efC=%zu) — 1M serial inserts...\n",
-                    HNSW_M, HNSW_EFC);
-        double build = build_ms_of([&] {
-            for (size_t i = 0; i < n_base; ++i) {
-                hnsw.add(base.data() + i * DIM);
-                if ((i + 1) % 100000 == 0)
-                    std::printf("    ... %zu / %zu inserted\n", i + 1, n_base);
-            }
-        });
-        std::printf("  build %.0f ms\n", build);
+        vdb::HNSWIndex<vdb::L2> hnsw(
+            {DIM, HNSW_M, HNSW_M, 2 * HNSW_M, HNSW_EFC, 0.0f});
+        const std::string cache = cache_dir + "/hnsw.snap";
+        const std::vector<uint64_t> params = {DIM, n_base, HNSW_M, HNSW_EFC};
+        double build = 0.0;
+        if (!force_rebuild && load_index_snapshot(cache, params, hnsw, build)) {
+            std::printf("\n[HNSW]  loaded cache %s (M=%zu, orig build %.0f ms)\n",
+                        cache.c_str(), HNSW_M, build);
+        } else {
+            std::printf("\n[HNSW]  building (M=%zu, efC=%zu) — 1M serial inserts...\n",
+                        HNSW_M, HNSW_EFC);
+            build = build_ms_of([&] {
+                for (size_t i = 0; i < n_base; ++i) {
+                    hnsw.add(base.data() + i * DIM);
+                    if ((i + 1) % 100000 == 0)
+                        std::printf("    ... %zu / %zu inserted\n", i + 1, n_base);
+                }
+            });
+            std::printf("  build %.0f ms\n", build);
+            save_index_snapshot(cache, build, params, hnsw);
+            std::printf("  cached -> %s\n", cache.c_str());
+        }
 
         const std::vector<size_t>* ef_grid[2] = {&HNSW_EF_K10, &HNSW_EF_K100};
         for (size_t ki = 0; ki < RECALL_K.size(); ++ki) {
@@ -311,6 +415,6 @@ void run_sift(const char* data_dir, const char* methods) {
         }
     }
 
-    write_csv(rows, !run_all);
-    std::printf("plot with:  python3 docs/plot_sift.py\n");
+    write_csv(rows, csv_path, variant, append);
+    std::printf("plot with:  python3 docs/plot_sift.py %s\n", csv_path.c_str());
 }
