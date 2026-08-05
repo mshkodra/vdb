@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -20,6 +21,16 @@ inline void put_floats(std::vector<uint8_t>& buf, const std::vector<float>& v) {
     put<uint64_t>(buf, v.size());
     const auto* p = reinterpret_cast<const uint8_t*>(v.data());
     buf.insert(buf.end(), p, p + v.size() * sizeof(float));
+}
+
+inline void put_bytes(std::vector<uint8_t>& buf, const std::vector<uint8_t>& v) {
+    put<uint64_t>(buf, v.size());
+    buf.insert(buf.end(), v.begin(), v.end());
+}
+
+inline void put_string(std::vector<uint8_t>& buf, const std::string& s) {
+    put<uint64_t>(buf, s.size());
+    buf.insert(buf.end(), s.begin(), s.end());
 }
 
 // Cursor over a byte buffer. Throws if a read runs past the end (truncated file).
@@ -46,6 +57,22 @@ public:
             p_ += n * sizeof(float);
         }
         return v;
+    }
+
+    std::vector<uint8_t> get_bytes() {
+        const uint64_t n = get<uint64_t>();
+        if (p_ + n > end_) throw std::runtime_error("snapshot truncated");
+        std::vector<uint8_t> v(p_, p_ + n);
+        p_ += n;
+        return v;
+    }
+
+    std::string get_string() {
+        const uint64_t n = get<uint64_t>();
+        if (p_ + n > end_) throw std::runtime_error("snapshot truncated");
+        std::string s(reinterpret_cast<const char*>(p_), n);
+        p_ += n;
+        return s;
     }
 
 private:

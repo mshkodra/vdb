@@ -47,7 +47,7 @@ std::unique_ptr<Index> VDB::make_index_(const VDBConfig& cfg) {
     return nullptr;
 }
 
-VDB::VDB(VDBConfig cfg) : config_(cfg) {
+VDB::VDB(VDBConfig cfg) : config_(cfg), meta_(cfg.schema) {
     index_ = make_index_(config_);
 }
 
@@ -69,6 +69,14 @@ ExternalId VDB::reserve_id() {
 }
 
 void VDB::insert_reserved(ExternalId ext, const float* vec) {
+    insert_reserved(ext, vec, Record{});
+}
+
+void VDB::insert_reserved(ExternalId ext, const float* vec, const Record& meta) {
+    // Validate before touching anything: a schema violation must not leave the
+    // parallel arrays half-appended (the index slot would already be allocated).
+    meta_.validate(meta);
+
     InternalId iid;
     // Phase 1 (exclusive, brief): reserve the node, size the arrays. The node is
     // marked deleted_=true so it is invisible while it is being linked.
@@ -80,6 +88,7 @@ void VDB::insert_reserved(ExternalId ext, const float* vec) {
         deleted_.push_back(true);   // pending: invisible until publish
         ++deleted_count_;
         vectors_.emplace_back(vec, vec + config_.dim);
+        meta_.append_row(meta);     // stays in step with the arrays above
         if (ext >= next_ext_id_) next_ext_id_ = ext + 1;  // keep ahead (replay path)
     }
     // Phase 2 (no lock): wire into the graph. Runs concurrently with other inserts'
@@ -96,8 +105,13 @@ void VDB::insert_reserved(ExternalId ext, const float* vec) {
 }
 
 ExternalId VDB::insert(const float* vec) {
+    return insert(vec, Record{});
+}
+
+ExternalId VDB::insert(const float* vec, const Record& meta) {
+    meta_.validate(meta);  // fail before minting an id we would then have to waste
     const ExternalId ext = reserve_id();
-    insert_reserved(ext, vec);
+    insert_reserved(ext, vec, meta);
     return ext;
 }
 
@@ -113,6 +127,18 @@ bool VDB::remove(ExternalId id) {
 }
 
 bool VDB::update(ExternalId id, const float* vec) {
+    return update_(id, vec, nullptr);
+}
+
+bool VDB::update(ExternalId id, const float* vec, const Record& meta) {
+    return update_(id, vec, &meta);
+}
+
+// `meta == nullptr` means "carry the existing row forward onto the replacement node",
+// which is what a vector-only update wants: the attributes did not change.
+bool VDB::update_(ExternalId id, const float* vec, const Record* meta) {
+    if (meta) meta_.validate(*meta);
+
     InternalId new_iid, old_iid;
     // Phase 1: allocate the replacement (pending). The old node stays live for now.
     {
@@ -126,6 +152,8 @@ bool VDB::update(ExternalId id, const float* vec) {
         deleted_.push_back(true);   // new node pending
         ++deleted_count_;
         vectors_.emplace_back(vec, vec + config_.dim);
+        if (meta) meta_.append_row(*meta);
+        else      meta_.append_row_copy(old_iid);
     }
     // Phase 2 (no lock): link the replacement into the graph.
     index_->link(new_iid);
@@ -146,6 +174,50 @@ bool VDB::contains(ExternalId id) const {
     return ext_to_int_.find(id) != ext_to_int_.end();
 }
 
+// Metadata-only update. Note what is *absent*: no index_->allocate, no link, no
+// tombstone. Rewriting a row is a handful of stores into the columns, because the
+// metadata lives beside the graph rather than inside it.
+bool VDB::set_metadata(ExternalId id, const Record& meta) {
+    meta_.validate(meta);
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    auto it = ext_to_int_.find(id);
+    if (it == ext_to_int_.end()) return false;
+    meta_.set_row(it->second, meta);
+    return true;
+}
+
+bool VDB::get_metadata(ExternalId id, Record& out) const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    auto it = ext_to_int_.find(id);
+    if (it == ext_to_int_.end()) return false;
+    out = meta_.get_row(it->second);
+    return true;
+}
+
+// Caller holds mu_. Templated on the sink so the emit call inlines — the same
+// reasoning as the distance functors: this loop must not pay an indirect call.
+template <class Emit>
+void VDB::collect_(const float* query, size_t K, Emit&& emit) const {
+    // Tombstoned hits are dropped after the index returns them, so ask for enough
+    // extra to still land K live results. K + deleted_count_ is exact for the
+    // brute oracle (worst case: every tombstone ranks ahead of the live top-K)
+    // and a safe over-fetch for the ANN indexes. Unbounded tombstone growth is
+    // the pressure that motivates compact().
+    //
+    // This over-fetch is a *post-filter* margin, and it only stays bounded because
+    // the predicate is "is live". A general attribute predicate matching fraction s
+    // would need K + N(1-s), i.e. a full scan — which is why filtered search needs
+    // more than post-filtering.
+    const size_t want = std::min(K + deleted_count_, index_->size());
+
+    size_t taken = 0;
+    for (auto& [iid, dist] : index_->search(query, want)) {
+        if (deleted_[iid]) continue;
+        emit(iid, dist);
+        if (++taken == K) break;
+    }
+}
+
 std::vector<ExternalId> VDB::search(const float* query, size_t K) const {
     if (K == 0) return {};
 
@@ -156,21 +228,22 @@ std::vector<ExternalId> VDB::search(const float* query, size_t K) const {
     // can release mu_ across index_->search() and re-take it only for the loop.
     std::shared_lock<std::shared_mutex> lk(mu_);
 
-    // Tombstoned hits are dropped after the index returns them, so ask for enough
-    // extra to still land K live results. K + deleted_count_ is exact for the
-    // brute oracle (worst case: every tombstone ranks ahead of the live top-K)
-    // and a safe over-fetch for the ANN indexes. Unbounded tombstone growth is
-    // the pressure that motivates compact().
-    const size_t want = std::min(K + deleted_count_, index_->size());
-
     std::vector<ExternalId> out;
     out.reserve(K);
-    for (auto& [iid, dist] : index_->search(query, want)) {
-        (void)dist;
-        if (deleted_[iid]) continue;
-        out.push_back(int_to_ext_[iid]);
-        if (out.size() == K) break;
-    }
+    collect_(query, K, [&](InternalId iid, float) { out.push_back(int_to_ext_[iid]); });
+    return out;
+}
+
+std::vector<Hit> VDB::search_hits(const float* query, size_t K) const {
+    if (K == 0) return {};
+    std::shared_lock<std::shared_mutex> lk(mu_);
+
+    std::vector<Hit> out;
+    out.reserve(K);
+    // The payload copy happens here, under the lock, and only for the K survivors.
+    collect_(query, K, [&](InternalId iid, float dist) {
+        out.push_back(Hit{int_to_ext_[iid], dist, meta_.payload(iid)});
+    });
     return out;
 }
 
@@ -179,13 +252,21 @@ void VDB::compact() {
     // Collect live vectors in internal-id order (deterministic rebuild).
     std::vector<std::vector<float>> live_vecs;
     std::vector<ExternalId>         live_exts;
+    std::vector<InternalId>         live_ids;
     live_vecs.reserve(live_count_);
     live_exts.reserve(live_count_);
+    live_ids.reserve(live_count_);
     for (InternalId i = 0; i < int_to_ext_.size(); ++i) {
         if (deleted_[i]) continue;
         live_vecs.push_back(std::move(vectors_[i]));
         live_exts.push_back(int_to_ext_[i]);
+        live_ids.push_back(i);
     }
+
+    // The cost of keying metadata by InternalId: renumbering the nodes renumbers the
+    // rows. Because the rebuild below re-adds the live vectors in exactly this order,
+    // new internal id i holds old row live_ids[i] — one out-of-place permutation.
+    meta_.permute(live_ids);
 
     // Fresh index and identity maps; external ids carry over unchanged.
     index_ = make_index_(config_);
