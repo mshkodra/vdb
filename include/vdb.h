@@ -123,6 +123,14 @@ public:
     // Schema fingerprint, for the durability layer's header validation.
     uint64_t schema_fingerprint() const { return meta_.fingerprint(); }
 
+    // Exact count of live rows where attribute `attr` holds `code` (a dictionary
+    // code for Tag, 0/1 for Bool) — the read side of MetadataStore's incrementally
+    // maintained counts, for selectivity estimation.
+    uint32_t attr_count(size_t attr, uint32_t code) const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return meta_.count(attr, code);
+    }
+
     // The ExternalId the next insert() will mint. Lets a durable wrapper log an
     // insert record before applying it. Not synchronised: the durable layer calls
     // this inside its own serialised write path (Stage 6/7 step 3).
