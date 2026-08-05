@@ -35,7 +35,10 @@ MetadataStore::MetadataStore(std::vector<AttrSpec> schema) : schema_(std::move(s
         columns_[a].type = schema_[a].type;
         // Bool's two codes (false/true) are known up front, unlike Tag's dictionary,
         // which grows as strings are interned.
-        if (columns_[a].type == AttrType::Bool) columns_[a].count.assign(2, 0);
+        if (columns_[a].type == AttrType::Bool) {
+            columns_[a].count.assign(2, 0);
+            columns_[a].postings.assign(2, {});
+        }
     }
     compute_fingerprint_();
 }
@@ -79,7 +82,8 @@ uint32_t MetadataStore::intern_(Column& c, const std::string& s) {
     const uint32_t code = static_cast<uint32_t>(c.dict.size());
     c.dict.push_back(s);
     c.codes.emplace(s, code);
-    c.count.push_back(0);  // a brand-new code starts with zero live rows
+    c.count.push_back(0);        // a brand-new code starts with zero live rows
+    c.postings.emplace_back();   // ...and an empty postings list
     return code;
 }
 
@@ -93,6 +97,15 @@ void MetadataStore::adjust_count_(size_t a, InternalId id, bool increment) {
     else           --c.count[code];
 }
 
+// Tag/Bool only; a no-op for any other column or an absent value. Never removes an
+// existing entry — see the postings() accessor's doc comment for why.
+void MetadataStore::add_posting_(size_t a, InternalId id) {
+    Column& c = columns_[a];
+    if ((c.type != AttrType::Tag && c.type != AttrType::Bool) || !c.present[id]) return;
+    const uint32_t code = static_cast<uint32_t>(c.data[id]);
+    c.postings[code].push_back(id);
+}
+
 void MetadataStore::mark_live(InternalId id) {
     for (size_t a = 0; a < columns_.size(); ++a) adjust_count_(a, id, /*increment=*/true);
 }
@@ -101,14 +114,19 @@ void MetadataStore::mark_dead(InternalId id) {
     for (size_t a = 0; a < columns_.size(); ++a) adjust_count_(a, id, /*increment=*/false);
 }
 
-void MetadataStore::rebuild_counts(const std::vector<bool>& deleted) {
-    for (auto& c : columns_)
-        if (c.type == AttrType::Tag || c.type == AttrType::Bool)
-            std::fill(c.count.begin(), c.count.end(), 0u);
+void MetadataStore::rebuild_derived_state(const std::vector<bool>& deleted) {
+    for (auto& c : columns_) {
+        if (c.type != AttrType::Tag && c.type != AttrType::Bool) continue;
+        std::fill(c.count.begin(), c.count.end(), 0u);
+        for (auto& p : c.postings) p.clear();
+    }
 
     for (InternalId id = 0; id < rows_; ++id) {
         if (deleted[id]) continue;
-        for (size_t a = 0; a < columns_.size(); ++a) adjust_count_(a, id, /*increment=*/true);
+        for (size_t a = 0; a < columns_.size(); ++a) {
+            adjust_count_(a, id, /*increment=*/true);
+            add_posting_(a, id);
+        }
     }
 }
 
@@ -122,6 +140,7 @@ bool MetadataStore::tag_code(size_t attr, const std::string& s, uint32_t& out) c
 
 void MetadataStore::append_row(const Record& rec) {
     validate(rec);
+    const InternalId id = static_cast<InternalId>(rows_);
     for (size_t a = 0; a < columns_.size(); ++a) {
         Column& c = columns_[a];
         if (rec.attrs.empty() || rec.attrs[a].is_null()) {
@@ -137,15 +156,22 @@ void MetadataStore::append_row(const Record& rec) {
     }
     payload_.push_back(rec.payload);
     ++rows_;
+    // Postings record every value a row was ever written with, independent of
+    // mark_live/mark_dead — a still-pending row (VDB hasn't published it yet) is
+    // filtered out at read time via deleted_, the same way a pending row already
+    // reads as absent from search().
+    for (size_t a = 0; a < columns_.size(); ++a) add_posting_(a, id);
 }
 
 void MetadataStore::append_row_copy(InternalId src) {
+    const InternalId id = static_cast<InternalId>(rows_);
     for (auto& c : columns_) {
         c.data.push_back(c.data[src]);
         c.present.push_back(c.present[src]);
     }
     payload_.push_back(payload_[src]);
     ++rows_;
+    for (size_t a = 0; a < columns_.size(); ++a) add_posting_(a, id);
 }
 
 void MetadataStore::set_row(InternalId id, const Record& rec) {
@@ -165,6 +191,9 @@ void MetadataStore::set_row(InternalId id, const Record& rec) {
             c.present[id] = true;
         }
         adjust_count_(a, id, /*increment=*/true);
+        // The old value's postings entry (if any) goes stale, not removed — same
+        // lazy-cleanup story as add_posting_ everywhere else.
+        add_posting_(a, id);
     }
     payload_[id] = rec.payload;
 }
@@ -181,6 +210,17 @@ void MetadataStore::permute(const std::vector<InternalId>& live) {
         }
         c.data.swap(data);
         c.present.swap(present);
+
+        // Postings are the one structure permute() doesn't just carry forward under
+        // translation: compact() is exactly the point where the lazy stale/dead
+        // entries postings() warns about get reclaimed, so rebuild each list fresh
+        // against the new numbering rather than remapping the old one.
+        if (c.type == AttrType::Tag || c.type == AttrType::Bool) {
+            for (auto& p : c.postings) p.clear();
+            for (InternalId new_id = 0; new_id < c.present.size(); ++new_id)
+                if (c.present[new_id])
+                    c.postings[static_cast<uint32_t>(c.data[new_id])].push_back(new_id);
+        }
     }
 
     std::vector<std::vector<uint8_t>> payload;
@@ -199,6 +239,7 @@ void MetadataStore::clear_rows() {
         // meaning the same string. Counts reset to zero but keep dict-sized shape —
         // every code that existed still exists, it just has no live rows right now.
         std::fill(c.count.begin(), c.count.end(), 0u);
+        for (auto& p : c.postings) p.clear();
     }
     payload_.clear();
     rows_ = 0;
@@ -270,12 +311,19 @@ void MetadataStore::deserialize(Reader& r) {
             c.codes.emplace(c.dict[i], static_cast<uint32_t>(i));
         }
 
-        // Counts are derived, not serialized: sized here to match the loaded
-        // dictionary (Tag) / the fixed false-true pair (Bool), then filled by a
-        // rebuild_counts() pass once the caller knows which rows are live.
-        if (c.type == AttrType::Tag) c.count.assign(c.dict.size(), 0);
-        else if (c.type == AttrType::Bool) c.count.assign(2, 0);
-        else c.count.clear();
+        // Counts and postings are derived, not serialized: sized here to match the
+        // loaded dictionary (Tag) / the fixed false-true pair (Bool), then filled by
+        // a rebuild_derived_state() pass once the caller knows which rows are live.
+        if (c.type == AttrType::Tag) {
+            c.count.assign(c.dict.size(), 0);
+            c.postings.assign(c.dict.size(), {});
+        } else if (c.type == AttrType::Bool) {
+            c.count.assign(2, 0);
+            c.postings.assign(2, {});
+        } else {
+            c.count.clear();
+            c.postings.clear();
+        }
     }
 
     const uint64_t n_pay = r.get<uint64_t>();

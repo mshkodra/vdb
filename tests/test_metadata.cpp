@@ -226,19 +226,21 @@ TEST(clear_rows_zeroes_counts_but_keeps_dictionary_shape) {
     EXPECT(still == shoes);
 }
 
-TEST(rebuild_counts_recomputes_from_a_liveness_bitmap) {
+TEST(rebuild_derived_state_recomputes_counts_and_postings) {
     MetadataStore m(demo_schema());
     m.append_row(row("shoes", 1, true, 0.0));   // 0: live
     m.append_row(row("shoes", 2, false, 0.0));  // 1: dead
     m.append_row(row("hats", 3, true, 0.0));    // 2: live
 
     // Simulates a snapshot load: columns are populated directly (as deserialize()
-    // does), counts start at zero, and rebuild_counts() is the only thing that fills
-    // them in, against a liveness bitmap it did not itself maintain.
+    // does), counts/postings start at zero/empty, and rebuild_derived_state() is the
+    // only thing that fills them in, against a liveness bitmap it did not itself
+    // maintain. append_row already recorded all three rows in postings — the point
+    // of this call is dropping row 1 (dead) from what it rebuilds.
     EXPECT(m.count(0, 0) == 0);
 
     std::vector<bool> deleted = {false, true, false};
-    m.rebuild_counts(deleted);
+    m.rebuild_derived_state(deleted);
 
     uint32_t shoes = 0, hats = 0;
     ASSERT(m.tag_code(0, "shoes", shoes));
@@ -248,10 +250,111 @@ TEST(rebuild_counts_recomputes_from_a_liveness_bitmap) {
     EXPECT(m.count(2, 1) == 2);      // in_stock=true on rows 0 and 2
     EXPECT(m.count(2, 0) == 0);      // row 1 (in_stock=false) is dead, not counted
 
-    // Idempotent: calling it again from the same bitmap doesn't double-count.
-    m.rebuild_counts(deleted);
+    EXPECT(m.postings(0, shoes) == std::vector<InternalId>{0});
+    EXPECT(m.postings(0, hats) == std::vector<InternalId>{2});
+    EXPECT(m.postings(2, 1) == std::vector<InternalId>({0, 2}));
+    EXPECT(m.postings(2, 0).empty());  // row 1 was the only in_stock=false row, and it's dead
+
+    // Idempotent: calling it again from the same bitmap doesn't double-count or
+    // duplicate postings entries.
+    m.rebuild_derived_state(deleted);
     EXPECT(m.count(0, shoes) == 1);
     EXPECT(m.count(2, 1) == 2);
+    EXPECT(m.postings(2, 1) == std::vector<InternalId>({0, 2}));
+}
+
+TEST(postings_records_a_row_at_append_time_before_it_is_live) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));
+    m.append_row(row("hats", 2, false, 0.0));
+
+    uint32_t shoes = 0, hats = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    ASSERT(m.tag_code(0, "hats", hats));
+
+    // Unlike count() (which stays 0 until mark_live), postings is populated at
+    // append time — a pending row is filtered out downstream via deleted_, not by
+    // withholding the postings entry.
+    EXPECT(m.postings(0, shoes) == std::vector<InternalId>{0});
+    EXPECT(m.postings(0, hats) == std::vector<InternalId>{1});
+    EXPECT(m.postings(2, 1) == std::vector<InternalId>{0});  // row 0: in_stock=true
+    EXPECT(m.postings(2, 0) == std::vector<InternalId>{1});  // row 1: in_stock=false
+}
+
+TEST(postings_keeps_stale_entries_after_mark_dead) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));
+    m.mark_live(0);
+    m.mark_dead(0);
+
+    uint32_t shoes = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    // count() reflects the tombstone immediately; postings does not — mark_dead only
+    // touches count(), by design (lazy cleanup, reclaimed at compact()).
+    EXPECT(m.count(0, shoes) == 0);
+    EXPECT(m.postings(0, shoes) == std::vector<InternalId>{0});
+}
+
+TEST(postings_keeps_the_old_entry_after_set_row_changes_the_value) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));
+    m.mark_live(0);
+    m.set_row(0, row("boots", 1, true, 0.0));
+
+    uint32_t shoes = 0, boots = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    ASSERT(m.tag_code(0, "boots", boots));
+    // The stale "shoes" entry survives (row 0 no longer holds that value, but
+    // nothing removed it); the new "boots" entry is added alongside it.
+    EXPECT(m.postings(0, shoes) == std::vector<InternalId>{0});
+    EXPECT(m.postings(0, boots) == std::vector<InternalId>{0});
+    // count() has no such ambiguity: it always reflects the current value only.
+    EXPECT(m.count(0, shoes) == 0);
+    EXPECT(m.count(0, boots) == 1);
+}
+
+TEST(postings_of_a_code_never_seen_is_empty) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));
+    EXPECT(m.postings(0, 999).empty());
+}
+
+TEST(clear_rows_also_clears_postings_but_keeps_dictionary_shape) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));
+
+    uint32_t shoes = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    EXPECT(!m.postings(0, shoes).empty());
+
+    m.clear_rows();
+    EXPECT(m.postings(0, shoes).empty());
+    EXPECT(m.postings(2, 1).empty());
+    // The dictionary (and thus which codes postings() can resolve) survives.
+    uint32_t still = 999;
+    EXPECT(m.tag_code(0, "shoes", still));
+    EXPECT(still == shoes);
+}
+
+TEST(permute_rebuilds_postings_dropping_dead_rows_and_renumbering_survivors) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));   // 0
+    m.append_row(row("shoes", 2, false, 0.0));  // 1
+    m.append_row(row("hats", 3, true, 0.0));    // 2
+    for (InternalId i = 0; i < 3; ++i) m.mark_live(i);
+    m.mark_dead(1);  // tombstone the middle row, same as VDB::remove() would
+
+    // Survivors keep their relative order but are renumbered: old 0 -> new 0,
+    // old 2 -> new 1. This is exactly what VDB::compact() passes to permute().
+    m.permute({0, 2});
+
+    uint32_t shoes = 0, hats = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    ASSERT(m.tag_code(0, "hats", hats));
+    EXPECT(m.postings(0, shoes) == std::vector<InternalId>{0});  // old id 0 -> new id 0
+    EXPECT(m.postings(0, hats) == std::vector<InternalId>{1});   // old id 2 -> new id 1
+    EXPECT(m.count(0, shoes) == 1);
+    EXPECT(m.count(0, hats) == 1);
 }
 
 TEST(indexed_flag_defaults_to_false) {
@@ -576,7 +679,7 @@ TEST(snapshot_round_trip_rebuilds_attr_counts) {
     }
 
     // Counts are not part of the snapshot bytes — this only proves anything if the
-    // fresh instance's rebuild_counts() pass actually ran on load.
+    // fresh instance's rebuild_derived_state() pass actually ran on load.
     VDB restored(demo_config());
     load_snapshot(restored, path);
     EXPECT(restored.size() == 4);
@@ -767,7 +870,7 @@ TEST(durable_recovery_restores_attr_counts_across_checkpoint_and_wal_tail) {
             ids.push_back(db.insert(v, row("pre", i, true, i)));
         }
         EXPECT(db.attr_count(2, 1) == 4);
-        db.checkpoint();  // exercises save_snapshot; a reopen will exercise rebuild_counts
+        db.checkpoint();  // exercises save_snapshot; a reopen will exercise rebuild_derived_state
 
         // Post-checkpoint: 3 more rows, in_stock=false, only in the WAL tail.
         for (int i = 4; i < 7; ++i) {

@@ -130,9 +130,9 @@ uint64_t load_snapshot(VDB& db, const std::string& path) {
     // Throws if the fingerprint disagrees with the schema this VDB was constructed
     // with — the metadata analogue of the dim/metric check above.
     db.meta_.deserialize(r);
-    // Counts aren't in the snapshot bytes (derived state); deserialize() only sized
-    // them. db.deleted_ is already loaded above, so rebuild against it here.
-    db.meta_.rebuild_counts(db.deleted_);
+    // Counts/postings aren't in the snapshot bytes (derived state); deserialize()
+    // only sized them. db.deleted_ is already loaded above, so rebuild against it.
+    db.meta_.rebuild_derived_state(db.deleted_);
 
     // ext_to_int_ holds only live ids; rebuild it from the surviving internal nodes.
     db.ext_to_int_.clear();
