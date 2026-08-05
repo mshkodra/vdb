@@ -44,6 +44,14 @@ enum class AttrType : uint8_t {
 struct AttrSpec {
     std::string name;
     AttrType    type = AttrType::Int64;
+
+    // Opt-in secondary index (sorted array / B-tree) for range predicates on this
+    // column, built alongside the base column once the index itself lands. Only
+    // meaningful for Int64/Float64 — Tag/Bool get a postings list unconditionally
+    // (it's basically free), so this flag stays false for them. Fixed at construction
+    // like `type`, and covered by the same fingerprint: turning indexing on or off is
+    // a layout change, same as renaming or retyping a column.
+    bool indexed = false;
 };
 
 // Type-punning helpers. Every column stores 8 raw bytes; the declared type says how

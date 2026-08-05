@@ -254,6 +254,53 @@ TEST(rebuild_counts_recomputes_from_a_liveness_bitmap) {
     EXPECT(m.count(2, 1) == 2);
 }
 
+TEST(indexed_flag_defaults_to_false) {
+    MetadataStore m(demo_schema());
+    for (const auto& s : m.schema()) EXPECT(!s.indexed);
+}
+
+TEST(indexed_allowed_only_on_numeric_columns) {
+    // Int64 and Float64 may opt into indexed — no throw.
+    { std::vector<AttrSpec> s = {{"price", AttrType::Int64, /*indexed=*/true}};
+      MetadataStore m(s);
+      EXPECT(m.schema()[0].indexed); }
+    { std::vector<AttrSpec> s = {{"rating", AttrType::Float64, /*indexed=*/true}};
+      MetadataStore m(s);
+      EXPECT(m.schema()[0].indexed); }
+
+    // Tag and Bool get a postings list unconditionally and never need this flag —
+    // declaring indexed=true on them is a schema error, not a silent no-op.
+    bool threw = false;
+    try {
+        std::vector<AttrSpec> s = {{"category", AttrType::Tag, /*indexed=*/true}};
+        MetadataStore m(s);
+    } catch (const std::invalid_argument&) { threw = true; }
+    EXPECT(threw);
+
+    threw = false;
+    try {
+        std::vector<AttrSpec> s = {{"in_stock", AttrType::Bool, /*indexed=*/true}};
+        MetadataStore m(s);
+    } catch (const std::invalid_argument&) { threw = true; }
+    EXPECT(threw);
+}
+
+TEST(indexed_flag_changes_the_fingerprint) {
+    std::vector<AttrSpec> plain  = {{"price", AttrType::Int64, false}};
+    std::vector<AttrSpec> idx    = {{"price", AttrType::Int64, true}};
+    MetadataStore m_plain(plain);
+    MetadataStore m_idx(idx);
+    // Same name, same type, different indexedness: a real layout change (the indexed
+    // column carries an extra secondary structure once PR9 wires it in), so the
+    // fingerprint must distinguish them the same way it distinguishes a retyped or
+    // renamed column.
+    EXPECT(m_plain.fingerprint() != m_idx.fingerprint());
+
+    // Re-declaring the identical schema is deterministic and reproducible.
+    MetadataStore m_idx2(idx);
+    EXPECT(m_idx.fingerprint() == m_idx2.fingerprint());
+}
+
 TEST(metadata_rejects_schema_violations) {
     MetadataStore m(demo_schema());
 
@@ -553,6 +600,31 @@ TEST(snapshot_rejects_a_changed_schema) {
 
     VDBConfig changed = demo_config();
     changed.schema[1].name = "cost";  // same types, different name -> different layout
+    VDB other(changed);
+
+    bool threw = false;
+    try {
+        load_snapshot(other, path);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    EXPECT(threw);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(snapshot_rejects_a_schema_that_only_flipped_indexed) {
+    const std::string dir = temp_dir("snapfpidx");
+    std::filesystem::create_directories(dir);
+    const std::string path = dir + "/snapshot";
+    {
+        VDB db(demo_config());  // price (attr 1, Int64) not indexed
+        const float v[2] = {1.0f, 1.0f};
+        db.insert(v, row("shoes", 1, true, 1.0));
+        save_snapshot(db, path, 1);
+    }
+
+    VDBConfig changed = demo_config();
+    changed.schema[1].indexed = true;  // same name/type, only indexedness differs
     VDB other(changed);
 
     bool threw = false;
