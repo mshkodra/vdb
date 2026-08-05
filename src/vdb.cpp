@@ -99,6 +99,7 @@ void VDB::insert_reserved(ExternalId ext, const float* vec, const Record& meta) 
         std::unique_lock<std::shared_mutex> lk(mu_);
         deleted_[iid] = false;
         --deleted_count_;
+        meta_.mark_live(iid);  // now visible to search: count it
         ext_to_int_[ext] = iid;
         ++live_count_;
     }
@@ -120,6 +121,7 @@ bool VDB::remove(ExternalId id) {
     auto it = ext_to_int_.find(id);
     if (it == ext_to_int_.end()) return false;
     deleted_[it->second] = true;   // tombstone; node stays in the graph
+    meta_.mark_dead(it->second);   // no longer visible to search: stop counting it
     ext_to_int_.erase(it);
     --live_count_;
     ++deleted_count_;
@@ -163,7 +165,9 @@ bool VDB::update_(ExternalId id, const float* vec, const Record* meta) {
     {
         std::unique_lock<std::shared_mutex> lk(mu_);
         deleted_[new_iid] = false; --deleted_count_;   // new goes live
+        meta_.mark_live(new_iid);
         deleted_[old_iid] = true;  ++deleted_count_;   // old becomes a tombstone
+        meta_.mark_dead(old_iid);
         ext_to_int_[id] = new_iid;
     }
     return true;

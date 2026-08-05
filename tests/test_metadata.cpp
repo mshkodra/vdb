@@ -108,6 +108,152 @@ TEST(metadata_nulls_are_distinct_from_zero) {
     for (size_t a = 0; a < 4; ++a) EXPECT(!m.present(1, a));
 }
 
+TEST(counts_stay_zero_until_marked_live) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));   // appended, not yet published
+    m.append_row(row("hats", 2, false, 0.0));
+
+    uint32_t shoes = 999, hats = 999;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    ASSERT(m.tag_code(0, "hats", hats));
+
+    // A freshly appended row is pending (mirrors VDB's allocate-before-link-before-
+    // publish window): interning the string grows the dictionary, but nothing is
+    // counted as live yet.
+    EXPECT(m.count(0, shoes) == 0);
+    EXPECT(m.count(0, hats) == 0);
+    EXPECT(m.count(2, 0) == 0);  // in_stock=false
+    EXPECT(m.count(2, 1) == 0);  // in_stock=true
+
+    m.mark_live(0);
+    EXPECT(m.count(0, shoes) == 1);
+    EXPECT(m.count(0, hats) == 0);
+    EXPECT(m.count(2, 1) == 1);  // row 0's in_stock=true
+
+    m.mark_live(1);
+    EXPECT(m.count(0, shoes) == 1);
+    EXPECT(m.count(0, hats) == 1);
+    EXPECT(m.count(2, 0) == 1);  // row 1's in_stock=false
+    EXPECT(m.count(2, 1) == 1);
+}
+
+TEST(mark_dead_removes_exactly_that_rows_contribution) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));
+    m.append_row(row("shoes", 2, true, 0.0));
+    m.mark_live(0);
+    m.mark_live(1);
+
+    uint32_t shoes = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    EXPECT(m.count(0, shoes) == 2);
+    EXPECT(m.count(2, 1) == 2);
+
+    m.mark_dead(0);
+    EXPECT(m.count(0, shoes) == 1);  // row 1 still live
+    EXPECT(m.count(2, 1) == 1);
+
+    m.mark_dead(1);
+    EXPECT(m.count(0, shoes) == 0);
+    EXPECT(m.count(2, 1) == 0);
+}
+
+TEST(set_row_moves_a_live_rows_count_between_values) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));
+    m.mark_live(0);
+
+    uint32_t shoes = 0, boots = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    EXPECT(m.count(0, shoes) == 1);
+    EXPECT(m.count(2, 1) == 1);  // in_stock=true
+
+    m.set_row(0, row("boots", 1, false, 0.0));  // still live, values changed
+    ASSERT(m.tag_code(0, "boots", boots));
+    EXPECT(m.count(0, shoes) == 0);   // old value's contribution is gone
+    EXPECT(m.count(0, boots) == 1);   // new value counted instead
+    EXPECT(m.count(2, 1) == 0);       // in_stock flipped true -> false
+    EXPECT(m.count(2, 0) == 1);
+}
+
+TEST(null_values_are_never_counted) {
+    MetadataStore m(demo_schema());
+    Record r;
+    r.attrs = {attr_null(), attr_int(0), attr_null(), attr_float(0.0)};
+    m.append_row(r);
+    m.mark_live(0);
+
+    // Nothing to count: the category and in_stock attrs are null on this row.
+    EXPECT(m.count(0, 0) == 0);
+    EXPECT(m.count(2, 0) == 0);
+    EXPECT(m.count(2, 1) == 0);
+
+    // set_row from null to a real value counts the new value with no stale decrement.
+    m.set_row(0, row("shoes", 0, true, 0.0));
+    uint32_t shoes = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    EXPECT(m.count(0, shoes) == 1);
+    EXPECT(m.count(2, 1) == 1);
+
+    // And back to null again: the count returns to zero, no leak.
+    m.set_row(0, r);
+    EXPECT(m.count(0, shoes) == 0);
+    EXPECT(m.count(2, 1) == 0);
+}
+
+TEST(count_of_a_code_never_seen_is_zero) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));
+    m.mark_live(0);
+    EXPECT(m.count(0, 999) == 0);  // dictionary code that was never interned
+}
+
+TEST(clear_rows_zeroes_counts_but_keeps_dictionary_shape) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));
+    m.mark_live(0);
+
+    uint32_t shoes = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    EXPECT(m.count(0, shoes) == 1);
+
+    m.clear_rows();
+    EXPECT(m.count(0, shoes) == 0);
+    EXPECT(m.count(2, 1) == 0);
+    // The dictionary itself survives clear_rows(), so the code still resolves.
+    uint32_t still = 999;
+    EXPECT(m.tag_code(0, "shoes", still));
+    EXPECT(still == shoes);
+}
+
+TEST(rebuild_counts_recomputes_from_a_liveness_bitmap) {
+    MetadataStore m(demo_schema());
+    m.append_row(row("shoes", 1, true, 0.0));   // 0: live
+    m.append_row(row("shoes", 2, false, 0.0));  // 1: dead
+    m.append_row(row("hats", 3, true, 0.0));    // 2: live
+
+    // Simulates a snapshot load: columns are populated directly (as deserialize()
+    // does), counts start at zero, and rebuild_counts() is the only thing that fills
+    // them in, against a liveness bitmap it did not itself maintain.
+    EXPECT(m.count(0, 0) == 0);
+
+    std::vector<bool> deleted = {false, true, false};
+    m.rebuild_counts(deleted);
+
+    uint32_t shoes = 0, hats = 0;
+    ASSERT(m.tag_code(0, "shoes", shoes));
+    ASSERT(m.tag_code(0, "hats", hats));
+    EXPECT(m.count(0, shoes) == 1);  // only row 0; row 1 is dead
+    EXPECT(m.count(0, hats) == 1);
+    EXPECT(m.count(2, 1) == 2);      // in_stock=true on rows 0 and 2
+    EXPECT(m.count(2, 0) == 0);      // row 1 (in_stock=false) is dead, not counted
+
+    // Idempotent: calling it again from the same bitmap doesn't double-count.
+    m.rebuild_counts(deleted);
+    EXPECT(m.count(0, shoes) == 1);
+    EXPECT(m.count(2, 1) == 2);
+}
+
 TEST(metadata_rejects_schema_violations) {
     MetadataStore m(demo_schema());
 
@@ -234,6 +380,64 @@ TEST(update_carries_metadata_forward_by_default) {
     EXPECT(got.payload == bytes("new"));
 }
 
+TEST(vdb_insert_and_remove_maintain_live_attr_counts) {
+    VDB db(demo_config());
+    const float v[2] = {0.0f, 0.0f};
+
+    const ExternalId a = db.insert(v, row("shoes", 1, true, 0.0));
+    const ExternalId b = db.insert(v, row("shoes", 2, true, 0.0));
+    db.insert(v, row("hats", 3, false, 0.0));
+
+    // category is attr 0, in_stock is attr 2 in demo_schema(); codes are assigned in
+    // first-seen order, so "shoes" is 0 here.
+    EXPECT(db.attr_count(0, 0) == 2);  // shoes
+    EXPECT(db.attr_count(0, 1) == 1);  // hats
+    EXPECT(db.attr_count(2, 1) == 2);  // in_stock=true
+    EXPECT(db.attr_count(2, 0) == 1);  // in_stock=false
+
+    ASSERT(db.remove(a));
+    EXPECT(db.attr_count(0, 0) == 1);  // one "shoes" row tombstoned
+    EXPECT(db.attr_count(2, 1) == 1);
+
+    ASSERT(db.remove(b));
+    EXPECT(db.attr_count(0, 0) == 0);  // no live "shoes" rows left
+    EXPECT(db.attr_count(2, 1) == 0);
+}
+
+TEST(vdb_update_moves_the_count_from_old_row_to_new) {
+    VDB db(demo_config());
+    const float v1[2] = {1.0f, 1.0f};
+    const float v2[2] = {5.0f, 5.0f};
+    const ExternalId id = db.insert(v1, row("shoes", 1, true, 0.0));
+    EXPECT(db.attr_count(0, 0) == 1);  // shoes
+
+    // Vector-only update carries the same metadata forward: old node tombstoned,
+    // new node live, same attribute value — net count is unchanged.
+    ASSERT(db.update(id, v2));
+    EXPECT(db.attr_count(0, 0) == 1);
+
+    // Update with a different metadata row moves the count to the new value.
+    ASSERT(db.update(id, v1, row("boots", 1, false, 0.0)));
+    uint32_t boots_code = 1;  // second tag string seen by this column
+    EXPECT(db.attr_count(0, 0) == 0);              // shoes: gone
+    EXPECT(db.attr_count(0, boots_code) == 1);      // boots: counted
+    EXPECT(db.attr_count(2, 1) == 0);
+    EXPECT(db.attr_count(2, 0) == 1);
+}
+
+TEST(vdb_set_metadata_moves_the_count_between_values) {
+    VDB db(demo_config());
+    const float v[2] = {1.0f, 1.0f};
+    const ExternalId id = db.insert(v, row("shoes", 1, true, 0.0));
+    EXPECT(db.attr_count(0, 0) == 1);
+
+    ASSERT(db.set_metadata(id, row("boots", 1, false, 0.0)));
+    EXPECT(db.attr_count(0, 0) == 0);  // shoes count released
+    EXPECT(db.attr_count(0, 1) == 1);  // boots counted
+    EXPECT(db.attr_count(2, 1) == 0);
+    EXPECT(db.attr_count(2, 0) == 1);
+}
+
 TEST(compact_permutes_metadata_with_internal_ids) {
     VDB db(demo_config(IndexKind::HNSW));
     std::vector<ExternalId> ids;
@@ -243,12 +447,19 @@ TEST(compact_permutes_metadata_with_internal_ids) {
                                        i * 0.5, bytes("p" + std::to_string(i)))));
     }
     // Tombstone the even ones, so the survivors are not a contiguous id range.
+    // Evens have in_stock=true (i % 2 == 0); after removing them, only in_stock=false
+    // survivors remain.
     for (int i = 0; i < 10; i += 2) ASSERT(db.remove(ids[i]));
     ASSERT(db.deleted_count() == 5);
+    EXPECT(db.attr_count(2, 1) == 0);  // in_stock=true: none left
+    EXPECT(db.attr_count(2, 0) == 5);  // in_stock=false: the 5 odd survivors
 
     db.compact();
     EXPECT(db.deleted_count() == 0);
     EXPECT(db.size() == 5);
+    // Compaction only renumbers internal ids; per-code live counts are untouched.
+    EXPECT(db.attr_count(2, 1) == 0);
+    EXPECT(db.attr_count(2, 0) == 5);
 
     // Every surviving external id must still see its own row after renumbering.
     for (int i = 1; i < 10; i += 2) {
@@ -294,6 +505,38 @@ TEST(snapshot_round_trips_metadata) {
         EXPECT(got.attrs[3].as_double() == i * 1.5);
         EXPECT(got.payload == bytes("pay" + std::to_string(i)));
     }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(snapshot_round_trip_rebuilds_attr_counts) {
+    const std::string dir = temp_dir("snapcounts");
+    std::filesystem::create_directories(dir);
+    const std::string path = dir + "/snapshot";
+
+    std::vector<ExternalId> ids;
+    {
+        VDB db(demo_config());
+        for (int i = 0; i < 5; ++i) {
+            const float v[2] = {static_cast<float>(i), 0.0f};
+            ids.push_back(db.insert(v, row(i % 2 ? "shoes" : "hats", i, i % 2 == 0, 0.0)));
+        }
+        // Rows: 0=hats/true 1=shoes/false 2=hats/true 3=shoes/false 4=hats/true.
+        ASSERT(db.remove(ids[2]));  // one of the three "hats"/in_stock=true rows dies
+        // Live: 0(hats,true) 1(shoes,false) 3(shoes,false) 4(hats,true).
+        EXPECT(db.attr_count(0, 0 /*hats, first-seen*/) == 2);
+        EXPECT(db.attr_count(0, 1 /*shoes*/) == 2);
+        save_snapshot(db, path, /*lsn=*/1);
+    }
+
+    // Counts are not part of the snapshot bytes — this only proves anything if the
+    // fresh instance's rebuild_counts() pass actually ran on load.
+    VDB restored(demo_config());
+    load_snapshot(restored, path);
+    EXPECT(restored.size() == 4);
+    EXPECT(restored.attr_count(0, 0) == 2);  // hats
+    EXPECT(restored.attr_count(0, 1) == 2);  // shoes
+    EXPECT(restored.attr_count(2, 1) == 2);  // in_stock=true: rows 0, 4
+    EXPECT(restored.attr_count(2, 0) == 2);  // in_stock=false: rows 1, 3
     std::filesystem::remove_all(dir);
 }
 
@@ -438,5 +681,52 @@ TEST(durable_recovery_across_a_checkpoint_keeps_metadata) {
         EXPECT(got.attrs[0].text == want);
         EXPECT(got.payload == bytes(want));
     }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(durable_recovery_restores_attr_counts_across_checkpoint_and_wal_tail) {
+    const std::string dir = temp_dir("ckptcounts");
+    std::vector<ExternalId> ids;
+    {
+        DurableVDB db(demo_config(), dir);
+        // Pre-checkpoint: 4 rows, in_stock=true, land in the snapshot image.
+        for (int i = 0; i < 4; ++i) {
+            const float v[2] = {static_cast<float>(i), 1.0f};
+            ids.push_back(db.insert(v, row("pre", i, true, i)));
+        }
+        EXPECT(db.attr_count(2, 1) == 4);
+        db.checkpoint();  // exercises save_snapshot; a reopen will exercise rebuild_counts
+
+        // Post-checkpoint: 3 more rows, in_stock=false, only in the WAL tail.
+        for (int i = 4; i < 7; ++i) {
+            const float v[2] = {static_cast<float>(i), 1.0f};
+            ids.push_back(db.insert(v, row("post", i, false, i)));
+        }
+        // One pre-checkpoint row is removed and one post-checkpoint row is updated
+        // to a different tag+bool, purely via the WAL — both must replay correctly.
+        ASSERT(db.remove(ids[0]));
+        ASSERT(db.set_metadata(ids[4], row("changed", 99, true, 0.0)));
+        db.sync();
+    }
+
+    DurableVDB reopened(demo_config(), dir);
+    EXPECT(reopened.size() == 6);
+    // Live: pre x3 (ids[1..3], in_stock=true), post x2 (ids[5..6], in_stock=false),
+    // changed x1 (ids[4], in_stock=true).
+    uint32_t pre = 0, post = 1, changed = 2;
+    Record probe;
+    ASSERT(reopened.get_metadata(ids[1], probe));
+    EXPECT(probe.attrs[0].text == "pre");
+    ASSERT(reopened.get_metadata(ids[5], probe));
+    EXPECT(probe.attrs[0].text == "post");
+    ASSERT(reopened.get_metadata(ids[4], probe));
+    EXPECT(probe.attrs[0].text == "changed");
+
+    EXPECT(reopened.attr_count(0, pre) == 3);
+    EXPECT(reopened.attr_count(0, post) == 2);
+    EXPECT(reopened.attr_count(0, changed) == 1);
+    EXPECT(reopened.attr_count(2, 1) == 4);  // in_stock=true: pre x3 + changed x1
+    EXPECT(reopened.attr_count(2, 0) == 2);  // in_stock=false: post x2
+
     std::filesystem::remove_all(dir);
 }

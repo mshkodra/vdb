@@ -124,6 +124,19 @@ public:
 
     void clear_rows();
 
+    // Row `id` has just become visible to search (VDB's publish step) / has just
+    // stopped being visible (tombstoned). Tag/Bool columns keep an exact per-code
+    // live count incrementally, at these two call sites plus set_row() — not
+    // recomputed by scanning, so a selectivity read is O(1) regardless of table size.
+    void mark_live(InternalId id);
+    void mark_dead(InternalId id);
+
+    // Rebuilds every column's live counts from scratch against a caller-supplied
+    // liveness bitmap. Counts are not part of the serialized snapshot bytes — this is
+    // what a snapshot load calls once, after deserialize(), since that path writes
+    // columns_ directly rather than going through mark_live/mark_dead.
+    void rebuild_counts(const std::vector<bool>& deleted);
+
     AttrValue                   get(InternalId id, size_t attr) const;
     Record                      get_row(InternalId id) const;
     const std::vector<uint8_t>& payload(InternalId id) const;
@@ -135,6 +148,14 @@ public:
     const uint64_t* column_raw(size_t attr) const { return columns_[attr].data.data(); }
     bool present(InternalId id, size_t attr) const { return columns_[attr].present[id]; }
     bool tag_code(size_t attr, const std::string& s, uint32_t& out) const;
+
+    // Exact count of live rows where column `attr` holds `code` (a dictionary code
+    // for Tag, 0/1 for Bool). O(1) — the payoff of maintaining it incrementally rather
+    // than scanning. 0 for a code the column has never seen.
+    uint32_t count(size_t attr, uint32_t code) const {
+        const auto& c = columns_[attr].count;
+        return code < c.size() ? c[code] : 0;
+    }
 
     void serialize(std::vector<uint8_t>& out) const;
     void deserialize(Reader& r);
@@ -149,7 +170,17 @@ private:
         // at insert to intern. Codes are dense and assigned in first-seen order.
         std::vector<std::string>                  dict;
         std::unordered_map<std::string, uint32_t> codes;
+
+        // Tag/Bool only: count[code] = number of *live* rows holding that code.
+        // Parallel to `dict` for Tag (grows alongside it); fixed at size 2 for Bool.
+        // Empty, untouched, for Int64/Float64 columns.
+        std::vector<uint32_t> count;
     };
+
+    // Tag/Bool columns only, no-op otherwise: if row `id` is present in column `a`,
+    // add (increment=true) or remove (increment=false) that value's contribution to
+    // its live count. Shared by mark_live/mark_dead/set_row.
+    void adjust_count_(size_t a, InternalId id, bool increment);
 
     uint32_t intern_(Column& c, const std::string& s);
     void     compute_fingerprint_();

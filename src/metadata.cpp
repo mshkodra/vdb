@@ -1,5 +1,6 @@
 #include "metadata.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace vdb {
@@ -26,6 +27,9 @@ MetadataStore::MetadataStore(std::vector<AttrSpec> schema) : schema_(std::move(s
             throw std::invalid_argument("attribute '" + schema_[a].name +
                                         "' declared with type null");
         columns_[a].type = schema_[a].type;
+        // Bool's two codes (false/true) are known up front, unlike Tag's dictionary,
+        // which grows as strings are interned.
+        if (columns_[a].type == AttrType::Bool) columns_[a].count.assign(2, 0);
     }
     compute_fingerprint_();
 }
@@ -68,7 +72,37 @@ uint32_t MetadataStore::intern_(Column& c, const std::string& s) {
     const uint32_t code = static_cast<uint32_t>(c.dict.size());
     c.dict.push_back(s);
     c.codes.emplace(s, code);
+    c.count.push_back(0);  // a brand-new code starts with zero live rows
     return code;
+}
+
+// Tag/Bool only; a no-op for any other column. `increment` is the row's current
+// contribution being added or removed from that value's live count.
+void MetadataStore::adjust_count_(size_t a, InternalId id, bool increment) {
+    Column& c = columns_[a];
+    if ((c.type != AttrType::Tag && c.type != AttrType::Bool) || !c.present[id]) return;
+    const uint32_t code = static_cast<uint32_t>(c.data[id]);
+    if (increment) ++c.count[code];
+    else           --c.count[code];
+}
+
+void MetadataStore::mark_live(InternalId id) {
+    for (size_t a = 0; a < columns_.size(); ++a) adjust_count_(a, id, /*increment=*/true);
+}
+
+void MetadataStore::mark_dead(InternalId id) {
+    for (size_t a = 0; a < columns_.size(); ++a) adjust_count_(a, id, /*increment=*/false);
+}
+
+void MetadataStore::rebuild_counts(const std::vector<bool>& deleted) {
+    for (auto& c : columns_)
+        if (c.type == AttrType::Tag || c.type == AttrType::Bool)
+            std::fill(c.count.begin(), c.count.end(), 0u);
+
+    for (InternalId id = 0; id < rows_; ++id) {
+        if (deleted[id]) continue;
+        for (size_t a = 0; a < columns_.size(); ++a) adjust_count_(a, id, /*increment=*/true);
+    }
 }
 
 bool MetadataStore::tag_code(size_t attr, const std::string& s, uint32_t& out) const {
@@ -109,16 +143,21 @@ void MetadataStore::append_row_copy(InternalId src) {
 
 void MetadataStore::set_row(InternalId id, const Record& rec) {
     validate(rec);
+    // A row reached here is always live (set_metadata resolves it through
+    // ext_to_int_, which only holds published rows), so the value being replaced was
+    // already counted — drop it before overwriting, add the new value back after.
     for (size_t a = 0; a < columns_.size(); ++a) {
+        adjust_count_(a, id, /*increment=*/false);
         Column& c = columns_[a];
         if (rec.attrs.empty() || rec.attrs[a].is_null()) {
             c.data[id]    = 0;
             c.present[id] = false;
-            continue;
+        } else {
+            const AttrValue& v = rec.attrs[a];
+            c.data[id]    = (v.type == AttrType::Tag ? intern_(c, v.text) : v.raw);
+            c.present[id] = true;
         }
-        const AttrValue& v = rec.attrs[a];
-        c.data[id]    = (v.type == AttrType::Tag ? intern_(c, v.text) : v.raw);
-        c.present[id] = true;
+        adjust_count_(a, id, /*increment=*/true);
     }
     payload_[id] = rec.payload;
 }
@@ -150,7 +189,9 @@ void MetadataStore::clear_rows() {
         c.data.clear();
         c.present.clear();
         // Dictionaries survive: codes already written into a snapshot must keep
-        // meaning the same string.
+        // meaning the same string. Counts reset to zero but keep dict-sized shape —
+        // every code that existed still exists, it just has no live rows right now.
+        std::fill(c.count.begin(), c.count.end(), 0u);
     }
     payload_.clear();
     rows_ = 0;
@@ -221,6 +262,13 @@ void MetadataStore::deserialize(Reader& r) {
             c.dict[i] = r.get_string();
             c.codes.emplace(c.dict[i], static_cast<uint32_t>(i));
         }
+
+        // Counts are derived, not serialized: sized here to match the loaded
+        // dictionary (Tag) / the fixed false-true pair (Bool), then filled by a
+        // rebuild_counts() pass once the caller knows which rows are live.
+        if (c.type == AttrType::Tag) c.count.assign(c.dict.size(), 0);
+        else if (c.type == AttrType::Bool) c.count.assign(2, 0);
+        else c.count.clear();
     }
 
     const uint64_t n_pay = r.get<uint64_t>();
