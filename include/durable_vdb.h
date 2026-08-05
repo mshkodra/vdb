@@ -68,6 +68,9 @@ public:
     bool get_metadata(ExternalId id, Record& out) const {
         return db_.get_metadata(id, out);
     }
+    uint32_t attr_count(size_t attr, uint32_t code) const {
+        return db_.attr_count(attr, code);
+    }
 
     void checkpoint();  // snapshot now and reclaim the covered WAL
     void sync();        // fsync the WAL now
