@@ -25,13 +25,19 @@ MetadataStore::MetadataStore(std::vector<AttrSpec> schema) : schema_(std::move(s
         if (schema_[a].type == AttrType::Null)
             throw std::invalid_argument("attribute '" + schema_[a].name +
                                         "' declared with type null");
+        if (schema_[a].indexed && schema_[a].type != AttrType::Int64 &&
+            schema_[a].type != AttrType::Float64)
+            throw std::invalid_argument("attribute '" + schema_[a].name + "' is indexed but " +
+                                        type_name(schema_[a].type) +
+                                        " columns are not indexable (Tag/Bool get a"
+                                        " postings list unconditionally)");
         columns_[a].type = schema_[a].type;
     }
     compute_fingerprint_();
 }
 
-// FNV-1a over the declared (name, type) pairs. Order-sensitive on purpose: the
-// columns are positional, so reordering the schema really is a different layout.
+// FNV-1a over the declared (name, type, indexed) triples. Order-sensitive on purpose:
+// the columns are positional, so reordering the schema really is a different layout.
 void MetadataStore::compute_fingerprint_() {
     uint64_t h = 1469598103934665603ull;
     auto mix   = [&h](uint8_t byte) {
@@ -42,6 +48,7 @@ void MetadataStore::compute_fingerprint_() {
         for (char c : s.name) mix(static_cast<uint8_t>(c));
         mix(0);
         mix(static_cast<uint8_t>(s.type));
+        mix(s.indexed ? 1 : 0);
     }
     fingerprint_ = h;
 }
