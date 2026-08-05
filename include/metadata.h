@@ -139,11 +139,12 @@ public:
     void mark_live(InternalId id);
     void mark_dead(InternalId id);
 
-    // Rebuilds every column's live counts from scratch against a caller-supplied
-    // liveness bitmap. Counts are not part of the serialized snapshot bytes — this is
-    // what a snapshot load calls once, after deserialize(), since that path writes
-    // columns_ directly rather than going through mark_live/mark_dead.
-    void rebuild_counts(const std::vector<bool>& deleted);
+    // Rebuilds every column's live counts and postings lists from scratch against a
+    // caller-supplied liveness bitmap. Neither is part of the serialized snapshot
+    // bytes — this is what a snapshot load calls once, after deserialize(), since
+    // that path writes columns_ directly rather than going through
+    // mark_live/mark_dead/append_row.
+    void rebuild_derived_state(const std::vector<bool>& deleted);
 
     AttrValue                   get(InternalId id, size_t attr) const;
     Record                      get_row(InternalId id) const;
@@ -165,6 +166,19 @@ public:
         return code < c.size() ? c[code] : 0;
     }
 
+    // The simplest possible inverted index: every InternalId ever written with this
+    // column holding `code`. Append-only, like the HNSW graph's tombstoned nodes —
+    // a row that was later deleted or overwritten to a different value leaves a
+    // stale entry here rather than paying an O(k) find-and-remove on every write.
+    // A consumer must additionally check present()/column_raw() (and, for liveness,
+    // VDB's own deleted_) before trusting an entry; postings.size() only equals
+    // count() exactly right after compact() rebuilds it (see permute()).
+    const std::vector<InternalId>& postings(size_t attr, uint32_t code) const {
+        static const std::vector<InternalId> empty;
+        const auto& p = columns_[attr].postings;
+        return code < p.size() ? p[code] : empty;
+    }
+
     void serialize(std::vector<uint8_t>& out) const;
     void deserialize(Reader& r);
 
@@ -183,12 +197,21 @@ private:
         // Parallel to `dict` for Tag (grows alongside it); fixed at size 2 for Bool.
         // Empty, untouched, for Int64/Float64 columns.
         std::vector<uint32_t> count;
+
+        // Tag/Bool only: postings[code] = every InternalId ever written with this
+        // value, in no particular order. Same shape as `count` (dict-sized for Tag,
+        // size 2 for Bool) but append-only — see the public postings() accessor.
+        std::vector<std::vector<InternalId>> postings;
     };
 
     // Tag/Bool columns only, no-op otherwise: if row `id` is present in column `a`,
     // add (increment=true) or remove (increment=false) that value's contribution to
     // its live count. Shared by mark_live/mark_dead/set_row.
     void adjust_count_(size_t a, InternalId id, bool increment);
+
+    // Tag/Bool columns only, no-op otherwise: if row `id` is present in column `a`,
+    // append it to that value's postings list. Never removes — see postings().
+    void add_posting_(size_t a, InternalId id);
 
     uint32_t intern_(Column& c, const std::string& s);
     void     compute_fingerprint_();
