@@ -48,13 +48,25 @@ public:
     DurableVDB(const DurableVDB&) = delete;
     DurableVDB& operator=(const DurableVDB&) = delete;
 
-    ExternalId insert(const float* vec);
+    ExternalId insert(const float* vec) { return insert(vec, Record{}); }
+    ExternalId insert(const float* vec, const Record& meta);
     bool       remove(ExternalId id);
     bool       update(ExternalId id, const float* vec);
+    bool       update(ExternalId id, const float* vec, const Record& meta);
+
+    // Metadata-only update: logged as its own record type so replay can apply it
+    // without a vector, and applied without any graph work.
+    bool set_metadata(ExternalId id, const Record& meta);
 
     bool                    contains(ExternalId id) const { return db_.contains(id); }
     std::vector<ExternalId> search(const float* query, size_t K) const {
         return db_.search(query, K);
+    }
+    std::vector<Hit> search_hits(const float* query, size_t K) const {
+        return db_.search_hits(query, K);
+    }
+    bool get_metadata(ExternalId id, Record& out) const {
+        return db_.get_metadata(id, out);
     }
 
     void checkpoint();  // snapshot now and reclaim the covered WAL
@@ -67,6 +79,8 @@ public:
 private:
     void recover_();
     void apply_(const WalRecord& r);
+    // Shared body of the two update() overloads; null `meta` keeps the existing row.
+    bool update_(ExternalId id, const float* vec, const Record* meta);
     void group_commit_(uint64_t lsn);  // PerOpSync: wait until lsn is durable (batched)
     void maybe_flush_();               // Periodic: lazy time-based fsync
     void finish_op_();                 // drop the in-flight count; wake a waiting checkpoint

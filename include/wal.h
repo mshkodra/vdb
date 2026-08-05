@@ -6,13 +6,15 @@
 #include <string>
 #include <vector>
 
+#include "metadata.h"
+
 namespace vdb {
 
 // On-disk WAL: a 32-byte header then length-prefixed, CRC32C-checked records.
 // Logical logging: each record is an operation to replay, not graph edges.
 
 constexpr uint32_t kWalMagic      = 0x56444257u;  // "VDBW"
-constexpr uint16_t kWalVersion    = 1;
+constexpr uint16_t kWalVersion    = 2;  // v2 adds metadata to Insert/Update + SetMeta
 constexpr size_t   kWalHeaderSize = 32;
 
 enum class WalRecordType : uint8_t {
@@ -20,28 +22,47 @@ enum class WalRecordType : uint8_t {
     Delete     = 2,
     Update     = 3,
     Checkpoint = 4,
+    SetMeta    = 5,  // metadata-only update; carries no vector
 };
 
-// vec is set only for Insert/Update. Checkpoint carries snapshot_id in ext_id.
+// vec is set only for Insert/Update; meta for Insert/Update/SetMeta. Checkpoint
+// carries snapshot_id in ext_id.
 struct WalRecord {
     WalRecordType      type;
     uint64_t           lsn;
     uint64_t           ext_id;
     std::vector<float> vec;
+    Record             meta;
 };
 
 struct WalHeader {
-    uint32_t magic   = kWalMagic;
-    uint16_t version = kWalVersion;
-    uint32_t dim     = 0;
-    uint8_t  metric  = 0;
+    uint32_t magic     = kWalMagic;
+    uint16_t version   = kWalVersion;
+    uint32_t dim       = 0;
+    uint8_t  metric    = 0;
+    uint64_t schema_fp = 0;  // MetadataStore::fingerprint(), checked on open
 };
 
-std::vector<uint8_t> encode_header(uint32_t dim, uint8_t metric);
+std::vector<uint8_t> encode_header(uint32_t dim, uint8_t metric, uint64_t schema_fp);
 bool decode_header(const uint8_t* data, size_t avail, WalHeader& out);
 
-// Frame: [length u32][crc u32][type u8][lsn u64][ext_id u64][vec?]. length counts
-// the body; the crc covers the length field and the body.
+// Frame: [length u32][crc u32][body]. length counts the body; the crc covers the
+// length field and the body. Body:
+//   [type u8][lsn u64][ext_id u64]
+//   Insert|Update: [vec_len u32][floats] [meta]
+//   SetMeta:       [meta]
+//   Delete|Checkpoint: nothing further
+// where meta := [attr_count u32] { [type u8], then per type: Tag -> [len u32][bytes],
+// Null -> nothing, else -> [raw u64] } [payload_len u32][bytes].
+//
+// The vector is explicitly length-prefixed in v2. In v1 its size was inferred from
+// the leftover frame length, which only works while it is the last field; metadata
+// follows it now, so the length has to be written down.
+//
+// Tag values are logged as *strings*, not dictionary codes. A code only means
+// something relative to a particular dictionary state, so logging codes would make
+// replay depend on the dictionary having been rebuilt identically. Strings cost more
+// bytes and are self-describing.
 std::vector<uint8_t> encode_record(const WalRecord& r);
 
 enum class DecodeStatus {
@@ -77,9 +98,10 @@ public:
     Wal(const Wal&) = delete;
     Wal& operator=(const Wal&) = delete;
 
-    void open(const std::string& dir, uint32_t dim, uint8_t metric, Options opts);
-    void open(const std::string& dir, uint32_t dim, uint8_t metric) {
-        open(dir, dim, metric, Options{});
+    void open(const std::string& dir, uint32_t dim, uint8_t metric, uint64_t schema_fp,
+              Options opts);
+    void open(const std::string& dir, uint32_t dim, uint8_t metric, uint64_t schema_fp) {
+        open(dir, dim, metric, schema_fp, Options{});
     }
 
     // Replay records in lsn order. Truncates a torn tail on the active segment;
@@ -121,9 +143,10 @@ private:
 
     mutable std::mutex   io_mu_;  // guards active_fd_/active_bytes_/segments_/highest_lsn_
     std::string          dir_;
-    uint32_t             dim_     = 0;
-    uint8_t              metric_  = 0;
-    size_t               seg_max_ = 16 * 1024 * 1024;
+    uint32_t             dim_       = 0;
+    uint8_t              metric_    = 0;
+    uint64_t             schema_fp_ = 0;
+    size_t               seg_max_   = 16 * 1024 * 1024;
     std::vector<Segment> segments_;
     int                  active_fd_    = -1;
     size_t               active_bytes_ = 0;

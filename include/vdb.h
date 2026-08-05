@@ -9,6 +9,7 @@
 
 #include "distance.h"
 #include "index.h"
+#include "metadata.h"
 
 namespace vdb {
 
@@ -18,6 +19,20 @@ struct VDBConfig {
     IndexKind kind   = IndexKind::HNSW;
     size_t    dim    = 0;
     Metric    metric = Metric::L2;
+    // Declared once and fixed for the life of the database. Persisted by fingerprint
+    // in the WAL and snapshot headers and checked on open, exactly like dim/metric.
+    // Empty means "no filterable attributes"; payload still works.
+    std::vector<AttrSpec> schema;
+};
+
+// A search result carrying its opaque payload. The payload is *copied* rather than
+// handed back as a span into payload_: the shared lock is released when search
+// returns, and a later compact() moves every row, so a span would dangle. Callers who
+// don't want the copy use search(), which returns bare ids.
+struct Hit {
+    ExternalId           id;
+    float                dist;
+    std::vector<uint8_t> payload;
 };
 
 // VDB is the database layer sitting on top of a pure Index. The index speaks
@@ -48,8 +63,11 @@ public:
     friend void     save_snapshot(const VDB& db, const std::string& path, uint64_t lsn);
     friend uint64_t load_snapshot(VDB& db, const std::string& path);
 
-    // Insert a new vector; returns its freshly minted, stable ExternalId.
+    // Insert a new vector; returns its freshly minted, stable ExternalId. The
+    // metadata overload attaches attributes (positional against config.schema) and
+    // an opaque payload; the bare overload inserts an all-null row.
     ExternalId insert(const float* vec);
+    ExternalId insert(const float* vec, const Record& meta);
 
     // Two-step insert for the durable layer (Stage 7 step 3), so it can mint the id
     // in its serialised WAL prefix and apply it after the fsync. reserve_id() hands
@@ -58,13 +76,25 @@ public:
     // which calls insert_reserved directly with logged ids — stays consistent).
     ExternalId reserve_id();
     void       insert_reserved(ExternalId ext, const float* vec);
+    void       insert_reserved(ExternalId ext, const float* vec, const Record& meta);
 
     // Tombstone the vector behind `id`. Returns false if `id` is unknown.
     bool remove(ExternalId id);
 
     // Tombstone the old vector and insert `vec` under the *same* ExternalId.
-    // Returns false if `id` is unknown.
+    // Returns false if `id` is unknown. The bare overload carries the existing
+    // metadata row forward onto the replacement node; the metadata overload replaces
+    // both the vector and the row.
     bool update(ExternalId id, const float* vec);
+    bool update(ExternalId id, const float* vec, const Record& meta);
+
+    // Replace the metadata row for `id` without touching the vector. O(1) and no
+    // graph work at all — the whole reason metadata lives outside the index rather
+    // than being folded into the node. Returns false if `id` is unknown.
+    bool set_metadata(ExternalId id, const Record& meta);
+
+    // Read back the attributes and payload for `id`. False if `id` is unknown.
+    bool get_metadata(ExternalId id, Record& out) const;
 
     // True iff `id` refers to a live (non-tombstoned) vector.
     bool contains(ExternalId id) const;
@@ -72,6 +102,9 @@ public:
     // Top-K live neighbours, nearest first, as external ids. Tombstoned hits are
     // skipped; the index is over-queried to compensate for them.
     std::vector<ExternalId> search(const float* query, size_t K) const;
+
+    // Same search, but each hit carries its distance and a copy of its payload.
+    std::vector<Hit> search_hits(const float* query, size_t K) const;
 
     // Rebuild the index from live vectors only, reclaiming tombstoned space.
     // External ids are preserved; internal ids are renumbered.
@@ -86,6 +119,9 @@ public:
         return deleted_count_;
     }
     size_t dim() const { return config_.dim; }             // immutable; no lock
+
+    // Schema fingerprint, for the durability layer's header validation.
+    uint64_t schema_fingerprint() const { return meta_.fingerprint(); }
 
     // The ExternalId the next insert() will mint. Lets a durable wrapper log an
     // insert record before applying it. Not synchronised: the durable layer calls
@@ -107,6 +143,11 @@ private:
     std::vector<bool>                          deleted_;     // by internal id
     std::vector<std::vector<float>>            vectors_;      // by internal id (raw copy)
 
+    // Filterable columns + opaque payloads, also by internal id — the same keyspace
+    // as deleted_/vectors_ above, so a predicate and the tombstone check are one
+    // indexed load each in the same loop.
+    MetadataStore meta_;
+
     ExternalId next_ext_id_   = 0;
     size_t     live_count_    = 0;
     size_t     deleted_count_ = 0;
@@ -115,6 +156,15 @@ private:
     // parallel arrays in step. Not synchronised — the caller must hold mu_ exclusive
     // (or be single-threaded, as in compact()).
     InternalId append_(ExternalId ext, const float* vec);
+
+    // Shared body of the two update() overloads; null `meta` carries the old row over.
+    bool update_(ExternalId id, const float* vec, const Record* meta);
+
+    // Shared body of the two search paths: run the index, drop tombstones, and hand
+    // each surviving (internal id, distance) to `emit` until K have been taken.
+    // Caller must hold mu_ (shared is enough).
+    template <class Emit>
+    void collect_(const float* query, size_t K, Emit&& emit) const;
 
     static std::unique_ptr<Index> make_index_(const VDBConfig& cfg);
 };

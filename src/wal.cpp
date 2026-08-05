@@ -1,6 +1,7 @@
 #include "wal.h"
 
 #include "crc32c.h"
+#include "serialize.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -17,12 +18,9 @@ namespace vdb {
 namespace {
 
 // Little-endian host assumed; serialization is raw memcpy of native integers.
-template <typename T>
-void put(std::vector<uint8_t>& buf, T v) {
-    const auto* p = reinterpret_cast<const uint8_t*>(&v);
-    buf.insert(buf.end(), p, p + sizeof(T));
-}
-
+// `put` comes from serialize.h (identical semantics); only the raw-pointer read
+// below is local, since the header's Reader is a cursor rather than a random-access
+// getter and the fixed-offset header fields are read positionally.
 template <typename T>
 T get(const uint8_t* p) {
     T v;
@@ -30,18 +28,78 @@ T get(const uint8_t* p) {
     return v;
 }
 
-// type + lsn + one u64 (ext_id or snapshot_id); Insert/Update append the vector.
+// type + lsn + one u64 (ext_id or snapshot_id); the rest of the body is per-type.
 constexpr size_t kBodyPrefix = sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint64_t);
+
+bool carries_vector(WalRecordType t) {
+    return t == WalRecordType::Insert || t == WalRecordType::Update;
+}
+bool carries_meta(WalRecordType t) {
+    return carries_vector(t) || t == WalRecordType::SetMeta;
+}
+
+// Self-describing so the encoder/decoder never need the schema: each value writes
+// its own type byte. The VDB layer still validates against the schema on apply.
+void put_meta(std::vector<uint8_t>& body, const Record& m) {
+    put(body, static_cast<uint32_t>(m.attrs.size()));
+    for (const auto& a : m.attrs) {
+        put(body, static_cast<uint8_t>(a.type));
+        if (a.type == AttrType::Null) continue;
+        if (a.type == AttrType::Tag) {
+            put(body, static_cast<uint32_t>(a.text.size()));
+            body.insert(body.end(), a.text.begin(), a.text.end());
+        } else {
+            put(body, a.raw);
+        }
+    }
+    put(body, static_cast<uint32_t>(m.payload.size()));
+    body.insert(body.end(), m.payload.begin(), m.payload.end());
+}
+
+// Bounds-checked via serialize.h's Reader, which throws past the end; decode_record
+// catches that and reports BadCrc (a checksum-valid but malformed frame).
+Record get_meta(Reader& rd) {
+    Record m;
+    const uint32_t n = rd.get<uint32_t>();
+    m.attrs.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        AttrValue v;
+        v.type = static_cast<AttrType>(rd.get<uint8_t>());
+        switch (v.type) {
+            case AttrType::Null: break;
+            case AttrType::Tag: {
+                const uint32_t len = rd.get<uint32_t>();
+                v.text.resize(len);
+                for (uint32_t k = 0; k < len; ++k)
+                    v.text[k] = static_cast<char>(rd.get<uint8_t>());
+                break;
+            }
+            case AttrType::Int64:
+            case AttrType::Float64:
+            case AttrType::Bool:
+                v.raw = rd.get<uint64_t>();
+                break;
+            default:
+                throw std::runtime_error("wal: bad attribute type");
+        }
+        m.attrs.push_back(std::move(v));
+    }
+    const uint32_t plen = rd.get<uint32_t>();
+    m.payload.resize(plen);
+    for (uint32_t k = 0; k < plen; ++k) m.payload[k] = rd.get<uint8_t>();
+    return m;
+}
 
 }  // namespace
 
-std::vector<uint8_t> encode_header(uint32_t dim, uint8_t metric) {
+std::vector<uint8_t> encode_header(uint32_t dim, uint8_t metric, uint64_t schema_fp) {
     std::vector<uint8_t> buf;
     buf.reserve(kWalHeaderSize);
     put(buf, kWalMagic);
     put(buf, kWalVersion);
     put(buf, dim);
     put(buf, metric);
+    put(buf, schema_fp);
     buf.resize(kWalHeaderSize, 0);
     return buf;
 }
@@ -49,23 +107,26 @@ std::vector<uint8_t> encode_header(uint32_t dim, uint8_t metric) {
 bool decode_header(const uint8_t* data, size_t avail, WalHeader& out) {
     if (avail < kWalHeaderSize) return false;
     size_t off = 0;
-    out.magic   = get<uint32_t>(data + off); off += sizeof(uint32_t);
-    out.version = get<uint16_t>(data + off); off += sizeof(uint16_t);
-    out.dim     = get<uint32_t>(data + off); off += sizeof(uint32_t);
-    out.metric  = get<uint8_t>(data + off);
+    out.magic     = get<uint32_t>(data + off); off += sizeof(uint32_t);
+    out.version   = get<uint16_t>(data + off); off += sizeof(uint16_t);
+    out.dim       = get<uint32_t>(data + off); off += sizeof(uint32_t);
+    out.metric    = get<uint8_t>(data + off);  off += sizeof(uint8_t);
+    out.schema_fp = get<uint64_t>(data + off);
     return out.magic == kWalMagic && out.version == kWalVersion;
 }
 
 std::vector<uint8_t> encode_record(const WalRecord& r) {
     std::vector<uint8_t> body;
-    body.reserve(kBodyPrefix + r.vec.size() * sizeof(float));
+    body.reserve(kBodyPrefix + sizeof(uint32_t) + r.vec.size() * sizeof(float));
     put(body, static_cast<uint8_t>(r.type));
     put(body, r.lsn);
     put(body, r.ext_id);
-    if (r.type == WalRecordType::Insert || r.type == WalRecordType::Update) {
+    if (carries_vector(r.type)) {
+        put(body, static_cast<uint32_t>(r.vec.size()));
         const auto* vp = reinterpret_cast<const uint8_t*>(r.vec.data());
         body.insert(body.end(), vp, vp + r.vec.size() * sizeof(float));
     }
+    if (carries_meta(r.type)) put_meta(body, r.meta);
 
     const uint32_t length = static_cast<uint32_t>(body.size());
 
@@ -107,15 +168,25 @@ DecodeStatus decode_record(const uint8_t* data, size_t avail,
 
     // Checksum-valid but malformed framing: treat as corruption, not a valid decode.
     if (length < kBodyPrefix) return DecodeStatus::BadCrc;
-    const size_t vec_bytes = length - kBodyPrefix;
-    if (vec_bytes % sizeof(float) != 0) return DecodeStatus::BadCrc;
 
-    size_t off = 0;
-    out.type   = static_cast<WalRecordType>(get<uint8_t>(body + off)); off += sizeof(uint8_t);
-    out.lsn    = get<uint64_t>(body + off); off += sizeof(uint64_t);
-    out.ext_id = get<uint64_t>(body + off); off += sizeof(uint64_t);
-    out.vec.resize(vec_bytes / sizeof(float));
-    if (vec_bytes) std::memcpy(out.vec.data(), body + off, vec_bytes);
+    // Every field past the prefix is variable-length now, so read through a
+    // bounds-checked cursor and turn an overrun into BadCrc.
+    try {
+        Reader rd(body, length);
+        out.type   = static_cast<WalRecordType>(rd.get<uint8_t>());
+        out.lsn    = rd.get<uint64_t>();
+        out.ext_id = rd.get<uint64_t>();
+        out.vec.clear();
+        out.meta = Record{};
+        if (carries_vector(out.type)) {
+            const uint32_t n = rd.get<uint32_t>();
+            out.vec.resize(n);
+            for (uint32_t i = 0; i < n; ++i) out.vec[i] = rd.get<float>();
+        }
+        if (carries_meta(out.type)) out.meta = get_meta(rd);
+    } catch (const std::exception&) {
+        return DecodeStatus::BadCrc;
+    }
 
     consumed = kFrameHeader + length;
     return DecodeStatus::Ok;
@@ -215,7 +286,7 @@ void Wal::open_new_segment_() {
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
     sys_check(fd >= 0, "create WAL segment");
 
-    const auto hdr = encode_header(dim_, metric_);
+    const auto hdr = encode_header(dim_, metric_, schema_fp_);
     write_at_(fd, 0, hdr.data(), hdr.size());
     sys_check(::fsync(fd) == 0, "fsync new WAL segment");
     fsync_dir_();  // persist the new directory entry
@@ -233,11 +304,13 @@ void Wal::rotate_() {
     open_new_segment_();
 }
 
-void Wal::open(const std::string& dir, uint32_t dim, uint8_t metric, Options opts) {
-    dir_     = dir;
-    dim_     = dim;
-    metric_  = metric;
-    seg_max_ = opts.segment_max_bytes;
+void Wal::open(const std::string& dir, uint32_t dim, uint8_t metric, uint64_t schema_fp,
+               Options opts) {
+    dir_        = dir;
+    dim_        = dim;
+    metric_     = metric;
+    schema_fp_  = schema_fp;
+    seg_max_    = opts.segment_max_bytes;
     std::filesystem::create_directories(dir_);
 
     const std::vector<uint64_t> numbers = discover_segments_();

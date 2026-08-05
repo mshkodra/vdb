@@ -35,7 +35,7 @@ size_t count_segments(const std::string& dir) {
 }
 
 WalRecord insert_rec(uint64_t lsn, uint64_t ext_id, std::vector<float> vec) {
-    return WalRecord{WalRecordType::Insert, lsn, ext_id, std::move(vec)};
+    return WalRecord{WalRecordType::Insert, lsn, ext_id, std::move(vec), {}};
 }
 
 }  // namespace
@@ -54,7 +54,7 @@ TEST(crc32c_detects_single_bit_flip) {
 }
 
 TEST(wal_header_round_trip) {
-    auto buf = encode_header(/*dim=*/128, /*metric=*/2);
+    auto buf = encode_header(/*dim=*/128, /*metric=*/2, /*schema_fp=*/0xABCDEF01u);
     EXPECT(buf.size() == kWalHeaderSize);
     WalHeader h;
     ASSERT(decode_header(buf.data(), buf.size(), h));
@@ -62,10 +62,11 @@ TEST(wal_header_round_trip) {
     EXPECT(h.version == kWalVersion);
     EXPECT(h.dim == 128);
     EXPECT(h.metric == 2);
+    EXPECT(h.schema_fp == 0xABCDEF01u);
 }
 
 TEST(wal_header_rejects_bad_magic) {
-    auto buf = encode_header(4, 0);
+    auto buf = encode_header(4, 0, 0);
     buf[0] ^= 0xFF;  // corrupt the magic
     WalHeader h;
     EXPECT(!decode_header(buf.data(), buf.size(), h));
@@ -136,7 +137,7 @@ TEST(wal_round_trip_across_segments) {
 
     {
         Wal w;
-        w.open(dir, /*dim=*/2, /*metric=*/0, opts);
+        w.open(dir, /*dim=*/2, /*metric=*/0, /*schema_fp=*/0, opts);
         for (uint64_t i = 1; i <= 6; ++i)
             w.append(insert_rec(i, i * 10, {float(i), float(i)}));
         w.sync();
@@ -148,7 +149,7 @@ TEST(wal_round_trip_across_segments) {
     std::vector<uint64_t> lsns;
     {
         Wal w;
-        w.open(dir, 2, 0, opts);
+        w.open(dir, 2, 0, 0, opts);
         w.replay([&](const WalRecord& r) { lsns.push_back(r.lsn); });
         EXPECT(w.max_lsn() == 6);
     }
@@ -165,7 +166,7 @@ TEST(wal_crash_injection_drops_torn_tail) {
     // Write 5 records in a single (large) segment, then close cleanly.
     {
         Wal w;
-        w.open(dir, /*dim=*/2, /*metric=*/0);
+        w.open(dir, /*dim=*/2, /*metric=*/0, /*schema_fp=*/0);
         for (uint64_t i = 1; i <= 5; ++i)
             w.append(insert_rec(i, i, {float(i), 0.0f}));
         w.sync();
@@ -183,7 +184,7 @@ TEST(wal_crash_injection_drops_torn_tail) {
     std::vector<uint64_t> lsns;
     {
         Wal w;
-        w.open(dir, 2, 0);
+        w.open(dir, 2, 0, 0);
         w.replay([&](const WalRecord& r) { lsns.push_back(r.lsn); });
         ASSERT(lsns.size() == 4);
         EXPECT(lsns.back() == 4);
@@ -196,7 +197,7 @@ TEST(wal_crash_injection_drops_torn_tail) {
     std::vector<uint64_t> after;
     {
         Wal w;
-        w.open(dir, 2, 0);
+        w.open(dir, 2, 0, 0);
         w.replay([&](const WalRecord& r) { after.push_back(r.lsn); });
     }
     ASSERT(after.size() == 5);
@@ -212,7 +213,7 @@ TEST(wal_truncate_reclaims_covered_segments) {
 
     {
         Wal w;
-        w.open(dir, /*dim=*/2, /*metric=*/0, opts);
+        w.open(dir, /*dim=*/2, /*metric=*/0, /*schema_fp=*/0, opts);
         for (uint64_t i = 1; i <= 6; ++i)
             w.append(insert_rec(i, i, {float(i), float(i)}));
         w.sync();
@@ -228,7 +229,7 @@ TEST(wal_truncate_reclaims_covered_segments) {
     std::vector<uint64_t> lsns;
     {
         Wal w;
-        w.open(dir, 2, 0, opts);
+        w.open(dir, 2, 0, 0, opts);
         w.replay([&](const WalRecord& r) { lsns.push_back(r.lsn); });
     }
     ASSERT(!lsns.empty());

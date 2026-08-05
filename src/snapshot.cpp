@@ -17,7 +17,7 @@ namespace vdb {
 namespace {
 
 constexpr uint32_t kSnapMagic   = 0x56444253u;  // "VDBS"
-constexpr uint16_t kSnapVersion = 1;
+constexpr uint16_t kSnapVersion = 2;  // v2 adds the metadata columns + payloads
 
 void sys_throw(const char* what) {
     throw std::runtime_error(std::string(what) + ": " + std::strerror(errno));
@@ -89,6 +89,11 @@ void save_snapshot(const VDB& db, const std::string& path, uint64_t lsn) {
     put<uint64_t>(buf, db.vectors_.size());
     for (const auto& v : db.vectors_) put_floats(buf, v);
 
+    // Columns, dictionaries, and payloads. Written before the index graph so a
+    // truncated file fails on the metadata rather than silently yielding a graph
+    // with no attributes attached.
+    db.meta_.serialize(buf);
+
     db.index_->serialize(buf);
 
     write_file_atomic(path, buf);
@@ -121,6 +126,10 @@ uint64_t load_snapshot(VDB& db, const std::string& path) {
     const uint64_t n_vec = r.get<uint64_t>();
     db.vectors_.resize(n_vec);
     for (uint64_t i = 0; i < n_vec; ++i) db.vectors_[i] = r.get_floats();
+
+    // Throws if the fingerprint disagrees with the schema this VDB was constructed
+    // with — the metadata analogue of the dim/metric check above.
+    db.meta_.deserialize(r);
 
     // ext_to_int_ holds only live ids; rebuild it from the surviving internal nodes.
     db.ext_to_int_.clear();

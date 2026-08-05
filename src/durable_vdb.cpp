@@ -32,7 +32,7 @@ void DurableVDB::recover_() {
         snapshot_lsn = load_snapshot(db_, snapshot_path_);
 
     wal_.open(wal_dir_, static_cast<uint32_t>(config_.dim),
-              static_cast<uint8_t>(config_.metric), opts_.wal);
+              static_cast<uint8_t>(config_.metric), db_.schema_fingerprint(), opts_.wal);
     wal_.replay([&](const WalRecord& r) {
         if (r.lsn > snapshot_lsn) apply_(r);  // skip records already in the snapshot
     });
@@ -45,10 +45,13 @@ void DurableVDB::apply_(const WalRecord& r) {
     switch (r.type) {
         case WalRecordType::Insert:
             // Replay uses the logged id directly, so the mapping is order-independent.
-            db_.insert_reserved(r.ext_id, r.vec.data());
+            db_.insert_reserved(r.ext_id, r.vec.data(), r.meta);
             break;
         case WalRecordType::Update:
-            db_.update(r.ext_id, r.vec.data());
+            db_.update(r.ext_id, r.vec.data(), r.meta);
+            break;
+        case WalRecordType::SetMeta:
+            db_.set_metadata(r.ext_id, r.meta);
             break;
         case WalRecordType::Delete:
             db_.remove(r.ext_id);
@@ -100,7 +103,7 @@ void DurableVDB::finish_op_() {
     commit_cv_.notify_all();  // a checkpoint may be waiting for the count to hit 0
 }
 
-ExternalId DurableVDB::insert(const float* vec) {
+ExternalId DurableVDB::insert(const float* vec, const Record& meta) {
     ExternalId ext;
     uint64_t   lsn;
     bool       do_ckpt = false;
@@ -111,7 +114,7 @@ ExternalId DurableVDB::insert(const float* vec) {
         ext = db_.reserve_id();
         lsn = next_lsn_++;
         wal_.append(WalRecord{WalRecordType::Insert, lsn, ext,
-                              std::vector<float>(vec, vec + config_.dim)});
+                              std::vector<float>(vec, vec + config_.dim), meta});
         {
             std::lock_guard<std::mutex> cg(commit_mutex_);
             ++in_flight_;
@@ -123,7 +126,7 @@ ExternalId DurableVDB::insert(const float* vec) {
     }
 
     if (opts_.policy == Policy::PerOpSync) group_commit_(lsn);  // durable before apply
-    db_.insert_reserved(ext, vec);                              // apply
+    db_.insert_reserved(ext, vec, meta);                        // apply
     if (opts_.policy == Policy::Periodic) maybe_flush_();       // relaxed: lazy fsync
 
     finish_op_();
@@ -138,7 +141,7 @@ bool DurableVDB::remove(ExternalId id) {
     {
         std::lock_guard<std::mutex> wg(write_mutex_);
         lsn = next_lsn_++;
-        wal_.append(WalRecord{WalRecordType::Delete, lsn, id, {}});
+        wal_.append(WalRecord{WalRecordType::Delete, lsn, id, {}, {}});
         {
             std::lock_guard<std::mutex> cg(commit_mutex_);
             ++in_flight_;
@@ -159,14 +162,31 @@ bool DurableVDB::remove(ExternalId id) {
 }
 
 bool DurableVDB::update(ExternalId id, const float* vec) {
+    return update_(id, vec, nullptr);
+}
+
+bool DurableVDB::update(ExternalId id, const float* vec, const Record& meta) {
+    return update_(id, vec, &meta);
+}
+
+bool DurableVDB::update_(ExternalId id, const float* vec, const Record* meta) {
     if (!db_.contains(id)) return false;
     uint64_t lsn;
     bool     do_ckpt = false;
+    Record   effective;
     {
         std::lock_guard<std::mutex> wg(write_mutex_);
+        // A vector-only update keeps the existing attributes. Materialize them here,
+        // inside the serialised prefix, so the log record is self-contained: replay
+        // never has to reconstruct "whatever the row happened to be" by tracking
+        // earlier records. Same principle as logging the full vector rather than a
+        // delta.
+        if (meta) effective = *meta;
+        else if (!db_.get_metadata(id, effective)) return false;
+
         lsn = next_lsn_++;
         wal_.append(WalRecord{WalRecordType::Update, lsn, id,
-                              std::vector<float>(vec, vec + config_.dim)});
+                              std::vector<float>(vec, vec + config_.dim), effective});
         {
             std::lock_guard<std::mutex> cg(commit_mutex_);
             ++in_flight_;
@@ -178,7 +198,34 @@ bool DurableVDB::update(ExternalId id, const float* vec) {
     }
 
     if (opts_.policy == Policy::PerOpSync) group_commit_(lsn);
-    db_.update(id, vec);
+    db_.update(id, vec, effective);
+    if (opts_.policy == Policy::Periodic) maybe_flush_();
+
+    finish_op_();
+    if (do_ckpt) checkpoint();
+    return true;
+}
+
+bool DurableVDB::set_metadata(ExternalId id, const Record& meta) {
+    if (!db_.contains(id)) return false;
+    uint64_t lsn;
+    bool     do_ckpt = false;
+    {
+        std::lock_guard<std::mutex> wg(write_mutex_);
+        lsn = next_lsn_++;
+        wal_.append(WalRecord{WalRecordType::SetMeta, lsn, id, {}, meta});
+        {
+            std::lock_guard<std::mutex> cg(commit_mutex_);
+            ++in_flight_;
+        }
+        if (++ops_since_checkpoint_ >= opts_.checkpoint_ops) {
+            ops_since_checkpoint_ = 0;
+            do_ckpt               = true;
+        }
+    }
+
+    if (opts_.policy == Policy::PerOpSync) group_commit_(lsn);
+    db_.set_metadata(id, meta);
     if (opts_.policy == Policy::Periodic) maybe_flush_();
 
     finish_op_();
@@ -198,7 +245,7 @@ void DurableVDB::checkpoint() {
     const uint64_t lsn = next_lsn_ - 1;  // highest lsn applied so far
 
     save_snapshot(db_, snapshot_path_, lsn);
-    wal_.append(WalRecord{WalRecordType::Checkpoint, next_lsn_++, snapshot_id_++, {}});
+    wal_.append(WalRecord{WalRecordType::Checkpoint, next_lsn_++, snapshot_id_++, {}, {}});
     wal_.sync();
     wal_.truncate(lsn);
 
