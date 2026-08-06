@@ -140,6 +140,59 @@ TEST(bplus_tree_range_scan_sees_duplicates_that_spilled_across_a_split) {
     EXPECT(found == std::vector<InternalId>({0, 1, 2, 3, 4}));
 }
 
+TEST(bplus_tree_insert_only_survives_duplicate_separators_in_one_parent) {
+    // Regression test for a real bug: insert()'s parent-update step used to find
+    // "the node that just split"'s slot by routing its new separator *value*
+    // through the parent (child_index_), not by the node's identity. That's only
+    // correct if the separator value is unique in the parent. With a small key
+    // domain and enough splits, two *different* children of the same parent can
+    // end up with the exact same max value as their separator (e.g. two children
+    // both maxing out at the same duplicate-heavy key) — child_index_ would then
+    // land on the *first* matching slot regardless of which child actually split,
+    // silently inserting the new sibling next to the wrong one and corrupting
+    // both child order and the leaf chain built on top of it. This needs no
+    // delete at all to trigger — small domain, small capacity, enough volume.
+    BTreeConfig cfg;
+    cfg.node_capacity = 8;
+    BPlusTree t(cfg);
+
+    std::mt19937_64 rng(7);
+    std::uniform_int_distribution<uint64_t> key_dist(0, 200);
+    std::map<uint64_t, std::vector<InternalId>> oracle;
+
+    constexpr int kN = 20000;
+    for (InternalId id = 0; id < kN; ++id) {
+        const uint64_t key = key_dist(rng);
+        t.insert(key, id);
+        oracle[key].push_back(id);
+    }
+    EXPECT(t.size() == kN);
+    ASSERT(t.height() > 2);  // confirms this actually exercised multi-level splits
+
+    for (uint64_t key = 0; key <= 200; ++key) {
+        auto found = t.find(key);
+        std::sort(found.begin(), found.end());
+        auto want_it = oracle.find(key);
+        std::vector<InternalId> want =
+            want_it == oracle.end() ? std::vector<InternalId>{} : want_it->second;
+        std::sort(want.begin(), want.end());
+        ASSERT(found == want);
+    }
+
+    // Also confirm the leaf chain itself wasn't corrupted (this is exactly what
+    // broke: a child spliced in at the wrong position desyncs next_leaf from
+    // actual sorted order) -- a full ascending range scan must visit every
+    // inserted entry exactly once, strictly in key order.
+    std::vector<uint64_t> seen_keys;
+    size_t seen_count = 0;
+    t.range(0, UINT64_MAX, [&](uint64_t k, InternalId) {
+        if (!seen_keys.empty()) EXPECT(seen_keys.back() <= k);
+        seen_keys.push_back(k);
+        ++seen_count;
+    });
+    EXPECT(seen_count == kN);
+}
+
 TEST(bplus_tree_random_mixed_workload_matches_a_multimap_oracle) {
     // Now that duplicates spanning a split are handled correctly (see the two
     // tests above), this checks full completeness, not just soundness: every id
@@ -266,5 +319,167 @@ TEST(bplus_tree_keys_from_sortable_bits_round_trip_through_insert_and_find) {
     for (size_t i = 0; i < doubles.size(); ++i) {
         EXPECT(double_tree.find(sortable_bits(doubles[i])) ==
                std::vector<InternalId>{static_cast<InternalId>(i)});
+    }
+}
+
+// --- delete / rebalance ---------------------------------------------------
+
+TEST(bplus_tree_remove_from_empty_tree_returns_false) {
+    BPlusTree t;
+    EXPECT(!t.remove(42, 0));
+}
+
+TEST(bplus_tree_remove_nonexistent_key_returns_false) {
+    BPlusTree t;
+    t.insert(42, 7);
+    EXPECT(!t.remove(41, 7));   // key not present at all
+    EXPECT(!t.remove(42, 99));  // key present, but not with this id
+    EXPECT(t.size() == 1);
+    EXPECT(t.find(42) == std::vector<InternalId>{7});  // untouched by the failed removes
+}
+
+TEST(bplus_tree_insert_then_remove_empties_the_tree) {
+    BPlusTree t;
+    t.insert(42, 7);
+    ASSERT(t.remove(42, 7));
+    EXPECT(t.size() == 0);
+    EXPECT(t.height() == 1);  // back to a single empty leaf, not a dangling structure
+    EXPECT(t.find(42).empty());
+    EXPECT(!t.remove(42, 7));  // second removal of the same entry fails
+}
+
+TEST(bplus_tree_remove_one_duplicate_keeps_the_others) {
+    BPlusTree t;
+    for (InternalId id = 0; id < 5; ++id) t.insert(/*key=*/9, id);
+    ASSERT(t.remove(9, 2));
+    EXPECT(t.size() == 4);
+    auto found = t.find(9);
+    std::sort(found.begin(), found.end());
+    EXPECT(found == std::vector<InternalId>({0, 1, 3, 4}));
+    EXPECT(!t.remove(9, 2));  // already gone
+}
+
+TEST(bplus_tree_remove_a_specific_id_when_duplicates_span_multiple_leaves) {
+    // Forces exactly the situation advance_to_next_leaf_ exists for: the id being
+    // removed isn't in the leaf a normal descent reaches, because enough
+    // duplicates of this key spilled across a split that it landed further down
+    // the chain.
+    BTreeConfig cfg;
+    cfg.node_capacity = 4;
+    BPlusTree t(cfg);
+    for (InternalId id = 0; id < 10; ++id) t.insert(/*key=*/7, id);
+    ASSERT(t.height() > 1);  // confirms the duplicates did split across leaves
+
+    ASSERT(t.remove(7, 9));  // id 9 is among the later-inserted, likely-later-leaf entries
+    ASSERT(t.remove(7, 0));  // and id 0 among the earliest
+    auto found = t.find(7);
+    std::sort(found.begin(), found.end());
+    EXPECT(found == std::vector<InternalId>({1, 2, 3, 4, 5, 6, 7, 8}));
+    EXPECT(t.size() == 8);
+}
+
+TEST(bplus_tree_remove_cascades_merges_and_shrinks_back_down) {
+    BTreeConfig cfg;
+    cfg.node_capacity = 4;
+    BPlusTree t(cfg);
+
+    for (uint64_t k = 0; k < 200; ++k) t.insert(k, static_cast<InternalId>(k));
+    const size_t built_height = t.height();
+    ASSERT(built_height > 2);  // several levels deep at this capacity
+
+    // Drain down to a handful of entries -- this has to cascade merges (and,
+    // eventually, root collapses) all the way, not just fix up one leaf. 5
+    // entries can't fit in a single capacity-4 leaf, so this can't shrink all the
+    // way to height 1, but it must shrink well below where it started.
+    for (uint64_t k = 0; k < 195; ++k) ASSERT(t.remove(k, static_cast<InternalId>(k)));
+
+    EXPECT(t.size() == 5);
+    EXPECT(t.height() < built_height);
+    for (uint64_t k = 0; k < 195; ++k) EXPECT(t.find(k).empty());
+    for (uint64_t k = 195; k < 200; ++k)
+        EXPECT(t.find(k) == std::vector<InternalId>{static_cast<InternalId>(k)});
+}
+
+TEST(bplus_tree_remove_everything_returns_to_an_empty_single_leaf) {
+    BTreeConfig cfg;
+    cfg.node_capacity = 4;
+    BPlusTree t(cfg);
+    for (uint64_t k = 0; k < 500; ++k) t.insert(k, static_cast<InternalId>(k));
+    ASSERT(t.height() > 1);
+
+    for (uint64_t k = 0; k < 500; ++k) ASSERT(t.remove(k, static_cast<InternalId>(k)));
+
+    EXPECT(t.size() == 0);
+    EXPECT(t.height() == 1);
+    EXPECT(t.find(0).empty());
+}
+
+TEST(bplus_tree_range_scan_stays_correct_after_heavy_delete_churn) {
+    // Merges rewrite next_leaf directly (merge_with_right_ has to fold the
+    // absorbed node's next_leaf into the survivor's) -- a bug there wouldn't
+    // necessarily break find() on any single key, but would show up as a broken
+    // or truncated chain under range(). Insert everything, delete every other
+    // entry (forces widespread merging), then range-scan the whole domain.
+    BTreeConfig cfg;
+    cfg.node_capacity = 4;
+    BPlusTree t(cfg);
+    for (uint64_t k = 0; k < 400; ++k) t.insert(k, static_cast<InternalId>(k));
+    for (uint64_t k = 0; k < 400; k += 2) ASSERT(t.remove(k, static_cast<InternalId>(k)));
+
+    std::vector<uint64_t> seen;
+    t.range(0, 1000, [&](uint64_t k, InternalId id) {
+        EXPECT(id == static_cast<InternalId>(k));
+        seen.push_back(k);
+    });
+
+    std::vector<uint64_t> want;
+    for (uint64_t k = 1; k < 400; k += 2) want.push_back(k);
+    EXPECT(seen == want);  // ascending, complete, no duplicates or gaps
+}
+
+TEST(bplus_tree_randomized_insert_remove_churn_matches_oracle) {
+    BTreeConfig cfg;
+    cfg.node_capacity = 8;  // small: makes splits, merges, and borrows all common
+    BPlusTree t(cfg);
+
+    std::mt19937_64 rng(42);
+    std::uniform_int_distribution<uint64_t> key_dist(0, 200);  // small domain: heavy duplicates
+    std::map<uint64_t, std::set<InternalId>> oracle;
+    std::vector<std::pair<uint64_t, InternalId>> live;
+
+    InternalId next_id = 0;
+    constexpr int kOps = 20000;
+    for (int op = 0; op < kOps; ++op) {
+        const bool do_insert = live.empty() || (rng() % 100 < 60);
+        if (do_insert) {
+            const uint64_t key = key_dist(rng);
+            const InternalId id = next_id++;
+            t.insert(key, id);
+            oracle[key].insert(id);
+            live.emplace_back(key, id);
+        } else {
+            std::uniform_int_distribution<size_t> pick(0, live.size() - 1);
+            const size_t idx = pick(rng);
+            const auto [key, id] = live[idx];
+            ASSERT(t.remove(key, id));
+            oracle[key].erase(id);
+            if (oracle[key].empty()) oracle.erase(key);
+            live[idx] = live.back();
+            live.pop_back();
+        }
+
+        // A full consistency pass is O(live entries) -- do it periodically rather
+        // than every op so this test finishes in reasonable time.
+        if (op % 500 == 0 || op == kOps - 1) {
+            size_t total = 0;
+            for (auto& [key, ids] : oracle) {
+                auto found = t.find(key);
+                std::sort(found.begin(), found.end());
+                std::vector<InternalId> want(ids.begin(), ids.end());
+                ASSERT(found == want);
+                total += ids.size();
+            }
+            EXPECT(t.size() == total);
+        }
     }
 }

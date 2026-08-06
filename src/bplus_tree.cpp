@@ -71,10 +71,15 @@ void BPlusTree::insert(uint64_t key, InternalId id) {
         path.pop_back();
 
         Node& p = nodes_[parent];
-        // Route the new separator through the *pre-update* parent: at this point
-        // nothing in p distinguishes "left" from "right" yet, so this lands on
-        // promoted_child's own slot, and the new sibling goes immediately after it.
-        const size_t ci = child_index_(p, sr.separator);
+        // Find promoted_child's own slot by *identity*, not by routing sr.separator
+        // through p as a value. Those agree only when sr.separator is the first
+        // matching key in p — with enough duplicate-heavy splits, some earlier
+        // sibling can already have promoted the exact same value as its own
+        // separator, and child_index_(p, sr.separator) would silently land on
+        // *that* slot instead, splicing the new sibling in next to the wrong
+        // child and corrupting both the child order and, downstream, the leaf
+        // chain built on top of it.
+        const size_t ci = child_position_(p, promoted_child);
         p.keys.insert(p.keys.begin() + static_cast<long>(ci), sr.separator);
         p.children.insert(p.children.begin() + static_cast<long>(ci) + 1, sr.right);
 
@@ -138,6 +143,187 @@ BPlusTree::SplitResult BPlusTree::split_internal_(NodeId id) {
     l.children.resize(mid + 1);
 
     return {right_id, separator};  // moved, not copied: an internal key is pure routing
+}
+
+bool BPlusTree::remove(uint64_t key, InternalId id) {
+    std::vector<NodeId> path;
+    NodeId cur = root_;
+    while (!nodes_[cur].is_leaf) {
+        path.push_back(cur);
+        cur = nodes_[cur].children[child_index_(nodes_[cur], key)];
+    }
+
+    // The target (key, id) might not be in the first leaf a normal descent
+    // reaches — same reason find()/range() have to walk next_leaf. Here the walk
+    // also has to keep `path` valid for whichever leaf we land on, since
+    // rebalance_after_erase_ needs a real ancestor chain, not just a node id.
+    for (;;) {
+        Node& leaf = nodes_[cur];
+        const auto lo = std::lower_bound(leaf.keys.begin(), leaf.keys.end(), key);
+        const auto hi = std::upper_bound(leaf.keys.begin(), leaf.keys.end(), key);
+
+        size_t pos = 0;
+        bool found = false;
+        for (auto it = lo; it != hi; ++it) {
+            pos = static_cast<size_t>(it - leaf.keys.begin());
+            if (leaf.values[pos] == id) { found = true; break; }
+        }
+
+        if (found) {
+            leaf.keys.erase(leaf.keys.begin() + static_cast<long>(pos));
+            leaf.values.erase(leaf.values.begin() + static_cast<long>(pos));
+            --size_;
+            rebalance_after_erase_(path, cur);
+            return true;
+        }
+
+        // hi short of the leaf's end means every entry equal to `key` is already
+        // accounted for right here — id genuinely isn't in the tree.
+        if (hi != leaf.keys.end()) return false;
+        if (!advance_to_next_leaf_(path, cur)) return false;
+        if (nodes_[cur].keys.empty() || nodes_[cur].keys.front() != key) return false;
+    }
+}
+
+size_t BPlusTree::child_position_(const Node& parent, NodeId child) const {
+    const auto it = std::find(parent.children.begin(), parent.children.end(), child);
+    assert(it != parent.children.end());
+    return static_cast<size_t>(it - parent.children.begin());
+}
+
+bool BPlusTree::advance_to_next_leaf_(std::vector<NodeId>& path, NodeId& cur) const {
+    while (!path.empty()) {
+        const NodeId parent = path.back();
+        const size_t idx = child_position_(nodes_[parent], cur);
+        if (idx + 1 < nodes_[parent].children.size()) {
+            // parent stays on path — it's still an ancestor of where we're headed.
+            NodeId node = nodes_[parent].children[idx + 1];
+            while (!nodes_[node].is_leaf) {
+                path.push_back(node);
+                node = nodes_[node].children.front();
+            }
+            cur = node;
+            return true;
+        }
+        // cur was the last child at this level: nothing to its right down here,
+        // climb one level and check again.
+        path.pop_back();
+        cur = parent;
+    }
+    return false;  // cur was the rightmost leaf in the whole tree
+}
+
+void BPlusTree::rebalance_after_erase_(std::vector<NodeId>& path, NodeId node) {
+    const size_t min_keys = cfg_.node_capacity / 2;
+    while (true) {
+        const bool is_root = path.empty();
+        if (is_root || nodes_[node].keys.size() >= min_keys) {
+            // The one thing still worth checking even when "no rebalance needed":
+            // an internal root that just merged down to its last key removes that
+            // key entirely, leaving one child and nothing left to route between —
+            // the tree is one level taller than it needs to be.
+            if (is_root && !nodes_[node].is_leaf && nodes_[node].keys.empty())
+                root_ = nodes_[node].children.front();
+            return;
+        }
+
+        const NodeId parent_id = path.back();
+        path.pop_back();
+        Node& parent = nodes_[parent_id];
+        const size_t ci = child_position_(parent, node);
+
+        const bool has_right = ci + 1 < parent.children.size();
+        const bool has_left  = ci > 0;
+        // A non-root node always has at least one sibling: its parent held at
+        // least min_keys+1 children before this removal even started (the same
+        // invariant we're restoring here), so has_right || has_left is guaranteed.
+
+        if (has_right && nodes_[parent.children[ci + 1]].keys.size() > min_keys) {
+            borrow_from_right_(parent, ci);
+            return;
+        }
+        if (has_left && nodes_[parent.children[ci - 1]].keys.size() > min_keys) {
+            borrow_from_left_(parent, ci);
+            return;
+        }
+        // Neither sibling can spare an entry: merge. merge_with_right_ always
+        // absorbs children[ci+1] into children[ci] — merging with the *left*
+        // sibling instead is the same operation one index over (our node becomes
+        // the thing being absorbed, its left sibling the survivor).
+        if (has_right) merge_with_right_(parent, ci);
+        else            merge_with_right_(parent, ci - 1);
+
+        // parent lost one key and one child; it may now be underfull itself.
+        // path is already parent's own ancestor chain (we popped parent_id off
+        // it above), so looping with node = parent_id checks exactly the right
+        // thing next.
+        node = parent_id;
+    }
+}
+
+void BPlusTree::borrow_from_right_(Node& parent, size_t ci) {
+    Node& underflow = nodes_[parent.children[ci]];
+    Node& right      = nodes_[parent.children[ci + 1]];
+    if (underflow.is_leaf) {
+        const uint64_t borrowed = right.keys.front();
+        underflow.keys.push_back(borrowed);
+        underflow.values.push_back(right.values.front());
+        right.keys.erase(right.keys.begin());
+        right.values.erase(right.values.begin());
+        parent.keys[ci] = borrowed;  // underflow's new max
+    } else {
+        // Rotate through the parent: the old separator is the only thing that
+        // ever said "underflow's subtree ends here" — it has to move down to
+        // keep bounding underflow's newly-adopted child, and right's first key
+        // (which used to bound right's first child from above) takes its place.
+        underflow.keys.push_back(parent.keys[ci]);
+        underflow.children.push_back(right.children.front());
+        parent.keys[ci] = right.keys.front();
+        right.keys.erase(right.keys.begin());
+        right.children.erase(right.children.begin());
+    }
+}
+
+void BPlusTree::borrow_from_left_(Node& parent, size_t ci) {
+    Node& underflow = nodes_[parent.children[ci]];
+    Node& left       = nodes_[parent.children[ci - 1]];
+    if (underflow.is_leaf) {
+        const uint64_t borrowed = left.keys.back();
+        underflow.keys.insert(underflow.keys.begin(), borrowed);
+        underflow.values.insert(underflow.values.begin(), left.values.back());
+        left.keys.pop_back();
+        left.values.pop_back();
+        parent.keys[ci - 1] = left.keys.back();  // left's new max, post-loan
+    } else {
+        underflow.keys.insert(underflow.keys.begin(), parent.keys[ci - 1]);
+        underflow.children.insert(underflow.children.begin(), left.children.back());
+        parent.keys[ci - 1] = left.keys.back();
+        left.keys.pop_back();
+        left.children.pop_back();
+    }
+}
+
+void BPlusTree::merge_with_right_(Node& parent, size_t ci) {
+    Node& left  = nodes_[parent.children[ci]];
+    Node& right = nodes_[parent.children[ci + 1]];
+    if (left.is_leaf) {
+        left.keys.insert(left.keys.end(), right.keys.begin(), right.keys.end());
+        left.values.insert(left.values.end(), right.values.begin(), right.values.end());
+        left.next_leaf = right.next_leaf;
+    } else {
+        // The separator between them is the only record of where "left's
+        // children" end and "right's children" begin — pull it down so the
+        // merged node still has that boundary, now as a real key instead of
+        // something borrowed from the parent.
+        left.keys.push_back(parent.keys[ci]);
+        left.keys.insert(left.keys.end(), right.keys.begin(), right.keys.end());
+        left.children.insert(left.children.end(), right.children.begin(), right.children.end());
+    }
+    // `right` is now unreachable — same "reclaimed at compact(), not on every
+    // write" tradeoff MetadataStore already makes for tombstoned rows, rather
+    // than compacting the node arena on every delete.
+    parent.keys.erase(parent.keys.begin() + static_cast<long>(ci));
+    parent.children.erase(parent.children.begin() + static_cast<long>(ci) + 1);
 }
 
 std::vector<InternalId> BPlusTree::find(uint64_t key) const {
