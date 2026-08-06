@@ -105,53 +105,117 @@ TEST(bplus_tree_duplicate_keys_within_one_leaf_are_all_found) {
     EXPECT(t.find(150).empty());
 }
 
-TEST(bplus_tree_point_lookup_is_leaf_local_for_duplicates_spanning_a_split) {
-    // Documented limitation (closed by leaf chaining, a later stage): if enough
-    // rows share one key that they spill across a split, find() only sees whichever
-    // leaf the descent happens to land on, not the full set. Pinning this down so a
-    // future change either fixes it deliberately (and updates this test) or notices
-    // immediately if the split boundary just happened to get lucky.
+TEST(bplus_tree_find_sees_duplicates_that_spilled_across_a_split) {
+    // PR5's version of this test pinned down a documented gap: find() only checked
+    // the one leaf a key's descent landed on. Leaf chaining is supposed to close
+    // that — this proves it actually does, for the exact scenario that used to slip
+    // through: enough rows sharing one key that a split cuts the run in half.
     BTreeConfig cfg;
     cfg.node_capacity = 4;
     BPlusTree t(cfg);
     for (InternalId id = 0; id < 5; ++id) t.insert(/*key=*/42, id);
 
     ASSERT(t.height() > 1);  // confirms the split actually happened
-    const auto found = t.find(42);
-    EXPECT(!found.empty());
-    EXPECT(found.size() < 5);  // NOT all 5 — the documented gap
+    auto found = t.find(42);
+    std::sort(found.begin(), found.end());
+    EXPECT(found == std::vector<InternalId>({0, 1, 2, 3, 4}));  // all 5, not just one leaf's share
 }
 
-TEST(bplus_tree_random_mixed_workload_is_sound) {
-    // Realistic duplicate density (many rows, few thousand distinct values) with a
-    // small enough capacity that both ordinary splits and duplicate-spanning splits
-    // are likely. Completeness isn't guaranteed here (see the leaf-local caveat
-    // above), so this checks the weaker but still load-bearing property: every id
-    // find() returns was actually inserted under that exact key — no cross-key
-    // corruption from a split's index arithmetic.
+TEST(bplus_tree_range_scan_sees_duplicates_that_spilled_across_a_split) {
+    // Same scenario as above, through range() instead of find() — the two share
+    // find()'s implementation (find(k) is range(k, k, ...)), but this exercises the
+    // hi-bound / exceeded_hi bookkeeping directly rather than through that alias.
+    BTreeConfig cfg;
+    cfg.node_capacity = 4;
+    BPlusTree t(cfg);
+    for (InternalId id = 0; id < 5; ++id) t.insert(/*key=*/42, id);
+    ASSERT(t.height() > 1);
+
+    std::vector<InternalId> found;
+    t.range(42, 42, [&](uint64_t k, InternalId id) {
+        EXPECT(k == 42);
+        found.push_back(id);
+    });
+    std::sort(found.begin(), found.end());
+    EXPECT(found == std::vector<InternalId>({0, 1, 2, 3, 4}));
+}
+
+TEST(bplus_tree_random_mixed_workload_matches_a_multimap_oracle) {
+    // Now that duplicates spanning a split are handled correctly (see the two
+    // tests above), this checks full completeness, not just soundness: every id
+    // find() returns really was inserted under that key, *and* every id that was
+    // really inserted under that key comes back. Realistic duplicate density (many
+    // rows, few thousand distinct values) with a small capacity, so both ordinary
+    // and duplicate-spanning splits are the common case here, not an edge case.
     BTreeConfig cfg;
     cfg.node_capacity = 16;
     BPlusTree t(cfg);
 
     std::mt19937_64 rng(2);
     std::uniform_int_distribution<uint64_t> key_dist(0, 2000);
-    std::map<InternalId, uint64_t> inserted_key_of;  // oracle: id -> its true key
+    std::map<uint64_t, std::vector<InternalId>> oracle;
 
     constexpr int kN = 20000;
     for (InternalId id = 0; id < kN; ++id) {
         const uint64_t key = key_dist(rng);
         t.insert(key, id);
-        inserted_key_of[id] = key;
+        oracle[key].push_back(id);
     }
     EXPECT(t.size() == kN);
 
-    // Sample a slice of the key space and confirm every returned id really belongs.
-    for (uint64_t key = 0; key <= 2000; key += 7) {
-        for (InternalId id : t.find(key)) {
-            const auto it = inserted_key_of.find(id);
-            ASSERT(it != inserted_key_of.end());  // id was really inserted at all
-            EXPECT(it->second == key);            // ...and under exactly this key
+    for (uint64_t key = 0; key <= 2000; ++key) {
+        auto found = t.find(key);
+        std::sort(found.begin(), found.end());
+        auto want_it = oracle.find(key);
+        std::vector<InternalId> want = want_it == oracle.end() ? std::vector<InternalId>{}
+                                                                : want_it->second;
+        std::sort(want.begin(), want.end());
+        ASSERT(found == want);
+    }
+}
+
+TEST(bplus_tree_range_scan_matches_an_oracle_over_many_leaves) {
+    BTreeConfig cfg;
+    cfg.node_capacity = 16;
+    BPlusTree t(cfg);
+
+    std::mt19937_64 rng(3);
+    std::uniform_int_distribution<uint64_t> key_dist(0, 5000);
+    std::map<uint64_t, std::vector<InternalId>> oracle;
+
+    constexpr int kN = 20000;
+    for (InternalId id = 0; id < kN; ++id) {
+        const uint64_t key = key_dist(rng);
+        t.insert(key, id);
+        oracle[key].push_back(id);
+    }
+    ASSERT(t.height() > 2);  // several leaves' worth of splitting, not a fluke
+
+    using Entry = std::pair<uint64_t, InternalId>;
+    const auto by_key_then_id = [](const Entry& a, const Entry& b) {
+        return a.first != b.first ? a.first < b.first : a.second < b.second;
+    };
+
+    // A handful of windows, including whole-range, a single key, and an inverted
+    // (lo > hi) bound that must yield nothing rather than misbehave.
+    const std::vector<std::pair<uint64_t, uint64_t>> windows = {
+        {0, 5000}, {100, 200}, {2500, 2500}, {4999, 5000}, {6000, 7000}, {10, 5},
+    };
+    for (auto [lo, hi] : windows) {
+        std::vector<Entry> got;
+        t.range(lo, hi, [&](uint64_t k, InternalId id) { got.emplace_back(k, id); });
+
+        // range() promises ascending key order on its own, before any sorting below.
+        for (size_t i = 1; i < got.size(); ++i) ASSERT(got[i - 1].first <= got[i].first);
+
+        std::vector<Entry> want;
+        for (auto& [k, ids] : oracle) {
+            if (k < lo || k > hi) continue;
+            for (InternalId id : ids) want.emplace_back(k, id);
         }
+        std::sort(got.begin(), got.end(), by_key_then_id);
+        std::sort(want.begin(), want.end(), by_key_then_id);
+        EXPECT(got == want);
     }
 }
 

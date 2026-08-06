@@ -22,10 +22,20 @@ BPlusTree::NodeId BPlusTree::new_internal_() {
 }
 
 size_t BPlusTree::child_index_(const Node& n, uint64_t key) const {
-    // First separator strictly greater than key; everything up to and including an
-    // equal separator routes left-of-it, i.e. a tie goes to the *next* child.
-    return static_cast<size_t>(std::upper_bound(n.keys.begin(), n.keys.end(), key) -
+    // First separator >= key; a tie routes to *that* child, not the next one. This
+    // has to agree with split_leaf_'s choice of which key to promote (the left
+    // half's max, so a separator always means "<= this value is/was on the left")
+    // — get the two out of sync and a query for a value that straddles a split
+    // lands to the right of some of its own matches, with no way for a *forward*-
+    // only leaf-chain walk to ever reach back for them.
+    return static_cast<size_t>(std::lower_bound(n.keys.begin(), n.keys.end(), key) -
                                n.keys.begin());
+}
+
+BPlusTree::NodeId BPlusTree::descend_to_leaf_(uint64_t key) const {
+    NodeId cur = root_;
+    while (!nodes_[cur].is_leaf) cur = nodes_[cur].children[child_index_(nodes_[cur], key)];
+    return cur;
 }
 
 void BPlusTree::insert(uint64_t key, InternalId id) {
@@ -97,7 +107,19 @@ BPlusTree::SplitResult BPlusTree::split_leaf_(NodeId id) {
     l.keys.resize(mid);
     l.values.resize(mid);
 
-    return {right_id, r.keys.front()};  // copy: the leaf still owns this entry too
+    // Splice the new right leaf into the chain between l and whatever l used to
+    // point to, so a range scan already in flight (or a fresh one starting to l's
+    // left) still walks every leaf in order.
+    r.next_leaf = l.next_leaf;
+    l.next_leaf = right_id;
+
+    // The separator is the *left* half's max, not the right half's min: with
+    // child_index_ routing ties left, a query for exactly this value must land on
+    // l first. If a run of duplicates straddles the cut (l.keys.back() ==
+    // r.keys.front(), the common case that actually exercises this), using the
+    // right half's min instead would send that query straight past l's matches —
+    // this is the leaf-split half of the bug fixed in child_index_'s comment.
+    return {right_id, l.keys.back()};  // copy: the leaf still owns this entry too
 }
 
 BPlusTree::SplitResult BPlusTree::split_internal_(NodeId id) {
@@ -119,18 +141,11 @@ BPlusTree::SplitResult BPlusTree::split_internal_(NodeId id) {
 }
 
 std::vector<InternalId> BPlusTree::find(uint64_t key) const {
-    NodeId cur = root_;
-    while (!nodes_[cur].is_leaf) {
-        cur = nodes_[cur].children[child_index_(nodes_[cur], key)];
-    }
-    const Node& leaf = nodes_[cur];
-    const auto lo = std::lower_bound(leaf.keys.begin(), leaf.keys.end(), key);
-    const auto hi = std::upper_bound(leaf.keys.begin(), leaf.keys.end(), key);
-
+    // An exact match is just a zero-width range: range()'s leaf-chain walk is what
+    // makes this correct even when key's duplicates spilled across a split, which a
+    // single-leaf lookup (this stage's predecessor) could not see.
     std::vector<InternalId> out;
-    out.reserve(static_cast<size_t>(hi - lo));
-    for (auto it = lo; it != hi; ++it)
-        out.push_back(leaf.values[static_cast<size_t>(it - leaf.keys.begin())]);
+    range(key, key, [&](uint64_t, InternalId id) { out.push_back(id); });
     return out;
 }
 
