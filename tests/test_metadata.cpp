@@ -431,6 +431,27 @@ std::vector<InternalId> collect_range_f64(const MetadataStore& m, size_t attr, d
     m.range(attr, lo, hi, [&](InternalId id) { out.push_back(id); });
     return out;
 }
+
+// price (Int64, indexed) | rating (Float64, NOT indexed) | category (Tag) | in_stock (Bool)
+// One indexed and one non-indexed numeric column on purpose, to exercise both
+// resolve() Range outcomes (materialized allowlist vs. unresolved) side by side.
+std::vector<AttrSpec> resolve_schema() {
+    return {{"price", AttrType::Int64, /*indexed=*/true},
+            {"rating", AttrType::Float64, /*indexed=*/false},
+            {"category", AttrType::Tag, /*indexed=*/false},
+            {"in_stock", AttrType::Bool, /*indexed=*/false}};
+}
+
+Record resolve_row(int64_t price, double rating, const std::string& cat, bool stock) {
+    Record r;
+    r.attrs = {attr_int(price), attr_float(rating), attr_tag(cat), attr_bool(stock)};
+    return r;
+}
+
+std::vector<InternalId> sorted(std::vector<InternalId> v) {
+    std::sort(v.begin(), v.end());
+    return v;
+}
 }  // namespace
 
 TEST(indexed_range_returns_exact_live_matches) {
@@ -523,6 +544,95 @@ TEST(snapshot_round_trip_rebuilds_the_index) {
 
     EXPECT(collect_range_i64(restored, 0, 0, 100) == std::vector<InternalId>({0, 1, 3, 4}));
     EXPECT(collect_range_i64(restored, 0, 25, 35).empty());  // dead row 2's value (30)
+}
+
+TEST(resolve_eq_tag_returns_exact_live_allowlist) {
+    MetadataStore m(resolve_schema());
+    m.append_row(resolve_row(1, 1.0, "shoes", true));  // 0
+    m.append_row(resolve_row(2, 2.0, "hats", true));   // 1
+    m.append_row(resolve_row(3, 3.0, "shoes", false)); // 2
+    for (InternalId i = 0; i < 3; ++i) m.mark_live(i);
+    std::vector<bool> deleted(3, false);
+    deleted[2] = true;  // row 2 (a "shoes") is dead
+
+    ResolvedPredicate r = m.resolve(pred_eq(2, attr_tag("shoes")), deleted);
+    ASSERT(r.allowlist.has_value());
+    EXPECT(sorted(*r.allowlist) == std::vector<InternalId>{0});  // row 2 filtered out
+    ASSERT(r.selectivity().has_value());
+    EXPECT(*r.selectivity() == 1);
+}
+
+TEST(resolve_eq_bool_returns_exact_live_allowlist) {
+    MetadataStore m(resolve_schema());
+    m.append_row(resolve_row(1, 1.0, "a", true));   // 0
+    m.append_row(resolve_row(2, 2.0, "b", false));  // 1
+    m.append_row(resolve_row(3, 3.0, "c", true));   // 2
+    for (InternalId i = 0; i < 3; ++i) m.mark_live(i);
+    std::vector<bool> deleted(3, false);
+
+    ResolvedPredicate r = m.resolve(pred_eq(3, attr_bool(true)), deleted);
+    ASSERT(r.allowlist.has_value());
+    EXPECT(sorted(*r.allowlist) == std::vector<InternalId>({0, 2}));
+}
+
+TEST(resolve_eq_on_a_tag_never_seen_returns_an_empty_allowlist_not_unresolved) {
+    MetadataStore m(resolve_schema());
+    m.append_row(resolve_row(1, 1.0, "shoes", true));
+    m.mark_live(0);
+    std::vector<bool> deleted(1, false);
+
+    ResolvedPredicate r = m.resolve(pred_eq(2, attr_tag("boots")), deleted);
+    ASSERT(r.allowlist.has_value());  // resolved, exact — just an empty match set
+    EXPECT(r.allowlist->empty());
+    EXPECT(*r.selectivity() == 0);
+}
+
+TEST(resolve_range_on_indexed_column_returns_exact_allowlist) {
+    MetadataStore m(resolve_schema());
+    for (int i = 0; i < 5; ++i) {
+        m.append_row(resolve_row((i + 1) * 10, 0.0, "c", true));
+        m.mark_live(static_cast<InternalId>(i));
+    }
+
+    ResolvedPredicate r = m.resolve(pred_range(0, attr_int(20), attr_int(40)), {});
+    ASSERT(r.allowlist.has_value());
+    EXPECT(sorted(*r.allowlist) == std::vector<InternalId>({1, 2, 3}));
+    EXPECT(*r.selectivity() == 3);
+}
+
+TEST(resolve_range_on_a_non_indexed_column_is_unresolved) {
+    MetadataStore m(resolve_schema());
+    m.append_row(resolve_row(1, 5.0, "c", true));
+    m.mark_live(0);
+
+    // "rating" (attr 1) is Float64 but not `indexed` — resolve() must not silently
+    // scan; it reports "can't answer this cheaply" instead.
+    ResolvedPredicate r = m.resolve(pred_range(1, attr_float(0.0), attr_float(10.0)), {});
+    EXPECT(!r.allowlist.has_value());
+    EXPECT(!r.selectivity().has_value());
+    // The original predicate survives, for a future per-candidate check.
+    EXPECT(r.predicate.attr == 1);
+    EXPECT(r.predicate.lo.as_double() == 0.0);
+    EXPECT(r.predicate.hi.as_double() == 10.0);
+}
+
+TEST(resolve_rejects_kind_and_value_type_mismatches) {
+    MetadataStore m(resolve_schema());
+
+    auto expect_throw = [&](const Predicate& p) {
+        bool threw = false;
+        try {
+            m.resolve(p, {});
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        EXPECT(threw);
+    };
+
+    expect_throw(pred_eq(0, attr_int(5)));               // Eq on Int64 (needs Tag/Bool)
+    expect_throw(pred_range(2, attr_tag("x"), attr_tag("y")));  // Range on Tag
+    expect_throw(pred_eq(2, attr_bool(true)));            // right kind, wrong value type
+    expect_throw(pred_range(0, attr_float(1.0), attr_float(2.0)));  // right kind, wrong bound type
 }
 
 TEST(metadata_rejects_schema_violations) {

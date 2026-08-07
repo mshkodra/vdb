@@ -307,6 +307,68 @@ Record MetadataStore::get_row(InternalId id) const {
     return rec;
 }
 
+ResolvedPredicate MetadataStore::resolve(const Predicate& pred, const std::vector<bool>& deleted) const {
+    const Column& c = columns_[pred.attr];
+    ResolvedPredicate out;
+    out.predicate = pred;
+
+    if (pred.kind == Predicate::Kind::Eq) {
+        if (c.type != AttrType::Tag && c.type != AttrType::Bool)
+            throw std::invalid_argument("Predicate::Eq on attribute '" + schema_[pred.attr].name +
+                                        "': " + type_name(c.type) +
+                                        " columns don't support equality predicates"
+                                        " (only Tag/Bool)");
+        if (pred.eq.type != c.type)
+            throw std::invalid_argument("Predicate::Eq value type does not match column '" +
+                                        schema_[pred.attr].name + "' (expects " +
+                                        type_name(c.type) + ")");
+
+        uint32_t code;
+        if (c.type == AttrType::Tag) {
+            if (!tag_code(pred.attr, pred.eq.text, code)) {
+                out.allowlist = std::vector<InternalId>{};  // value never interned: no matches
+                return out;
+            }
+        } else {
+            code = pred.eq.as_bool() ? 1u : 0u;
+        }
+        // postings() is an append-only superset (dead/pending entries included) —
+        // filter against the caller's liveness bitmap to make this exact.
+        std::vector<InternalId> ids;
+        for (InternalId id : postings(pred.attr, code))
+            if (id < deleted.size() && !deleted[id]) ids.push_back(id);
+        out.allowlist = std::move(ids);
+        return out;
+    }
+
+    // Kind::Range
+    if (c.type != AttrType::Int64 && c.type != AttrType::Float64)
+        throw std::invalid_argument("Predicate::Range on attribute '" + schema_[pred.attr].name +
+                                    "': " + type_name(c.type) +
+                                    " columns don't support range predicates"
+                                    " (only Int64/Float64)");
+    if (pred.lo.type != c.type || pred.hi.type != c.type)
+        throw std::invalid_argument("Predicate::Range bound type does not match column '" +
+                                    schema_[pred.attr].name + "' (expects " + type_name(c.type) +
+                                    ")");
+
+    // Not indexed: an exact match set would cost an O(N) scan, so this isn't done
+    // eagerly here — allowlist stays nullopt, predicate stays for a future
+    // per-candidate check. See ResolvedPredicate's own doc comment.
+    if (!c.index) return out;
+
+    std::vector<InternalId> ids;
+    // range() is already live-only by construction (see its own doc comment) — no
+    // filtering needed here, unlike the Eq/postings path above.
+    if (c.type == AttrType::Int64)
+        range(pred.attr, pred.lo.as_int(), pred.hi.as_int(), [&](InternalId id) { ids.push_back(id); });
+    else
+        range(pred.attr, pred.lo.as_double(), pred.hi.as_double(),
+              [&](InternalId id) { ids.push_back(id); });
+    out.allowlist = std::move(ids);
+    return out;
+}
+
 const std::vector<uint8_t>& MetadataStore::payload(InternalId id) const {
     return payload_[id];
 }
