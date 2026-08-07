@@ -404,6 +404,127 @@ TEST(indexed_flag_changes_the_fingerprint) {
     EXPECT(m_idx.fingerprint() == m_idx2.fingerprint());
 }
 
+namespace {
+// price (Int64, indexed) | rating (Float64, indexed) | category (Tag, not indexed)
+std::vector<AttrSpec> indexed_schema() {
+    return {{"price", AttrType::Int64, /*indexed=*/true},
+            {"rating", AttrType::Float64, /*indexed=*/true},
+            {"category", AttrType::Tag, /*indexed=*/false}};
+}
+
+Record indexed_row(int64_t price, double rating, const std::string& cat) {
+    Record r;
+    r.attrs = {attr_int(price), attr_float(rating), attr_tag(cat)};
+    return r;
+}
+
+std::vector<InternalId> collect_range_i64(const MetadataStore& m, size_t attr, int64_t lo,
+                                          int64_t hi) {
+    std::vector<InternalId> out;
+    m.range(attr, lo, hi, [&](InternalId id) { out.push_back(id); });
+    return out;
+}
+
+std::vector<InternalId> collect_range_f64(const MetadataStore& m, size_t attr, double lo,
+                                          double hi) {
+    std::vector<InternalId> out;
+    m.range(attr, lo, hi, [&](InternalId id) { out.push_back(id); });
+    return out;
+}
+}  // namespace
+
+TEST(indexed_range_returns_exact_live_matches) {
+    MetadataStore m(indexed_schema());
+    // price: 10, 20, 30, 40, 50 — rating: 1.5, 2.5, 3.5, 4.5, 5.5
+    for (int i = 0; i < 5; ++i) {
+        m.append_row(indexed_row((i + 1) * 10, (i + 1) + 0.5, "cat" + std::to_string(i)));
+        m.mark_live(static_cast<InternalId>(i));
+    }
+    EXPECT(collect_range_i64(m, 0, 20, 40) == std::vector<InternalId>({1, 2, 3}));
+    EXPECT(collect_range_i64(m, 0, 0, 5) == std::vector<InternalId>{});      // below all
+    EXPECT(collect_range_i64(m, 0, 100, 200) == std::vector<InternalId>{});  // above all
+    EXPECT(collect_range_i64(m, 0, 10, 50) == std::vector<InternalId>({0, 1, 2, 3, 4}));
+
+    EXPECT(collect_range_f64(m, 1, 2.0, 4.0) == std::vector<InternalId>({1, 2}));
+}
+
+TEST(indexed_range_excludes_dead_and_pending_rows) {
+    MetadataStore m(indexed_schema());
+    m.append_row(indexed_row(10, 1.0, "a"));  // 0
+    m.append_row(indexed_row(20, 2.0, "b"));  // 1
+    m.append_row(indexed_row(30, 3.0, "c"));  // 2
+    m.mark_live(0);
+    m.mark_live(1);
+    // Row 2 stays pending — never marked live, same as a not-yet-published VDB insert.
+
+    EXPECT(collect_range_i64(m, 0, 0, 100) == std::vector<InternalId>({0, 1}));
+
+    m.mark_dead(1);
+    EXPECT(collect_range_i64(m, 0, 0, 100) == std::vector<InternalId>{0});
+}
+
+TEST(indexed_range_reflects_set_row_overwrite) {
+    MetadataStore m(indexed_schema());
+    m.append_row(indexed_row(10, 1.0, "a"));
+    m.mark_live(0);
+    EXPECT(collect_range_i64(m, 0, 5, 15) == std::vector<InternalId>{0});
+
+    m.set_row(0, indexed_row(50, 9.0, "a"));
+    EXPECT(collect_range_i64(m, 0, 5, 15).empty());     // old value gone
+    EXPECT(collect_range_i64(m, 0, 45, 55) == std::vector<InternalId>{0});  // new value present
+}
+
+TEST(indexed_range_is_a_noop_on_a_column_without_an_index) {
+    // "category" (attr 2) is Tag, never indexed — range() must not throw or crash,
+    // just report nothing, the same lenient contract postings()/count() already have
+    // for an argument that doesn't apply.
+    MetadataStore m(indexed_schema());
+    m.append_row(indexed_row(10, 1.0, "a"));
+    m.mark_live(0);
+    EXPECT(collect_range_i64(m, 2, 0, 1000).empty());
+}
+
+TEST(permute_rebuilds_the_index_dropping_dead_rows_and_renumbering_survivors) {
+    MetadataStore m(indexed_schema());
+    m.append_row(indexed_row(10, 1.0, "a"));  // 0
+    m.append_row(indexed_row(20, 2.0, "b"));  // 1
+    m.append_row(indexed_row(30, 3.0, "c"));  // 2
+    for (InternalId i = 0; i < 3; ++i) m.mark_live(i);
+    m.mark_dead(1);  // tombstone the middle row, same as VDB::remove() would
+
+    // Survivors keep their relative order but are renumbered: old 0 -> new 0,
+    // old 2 -> new 1 — exactly what VDB::compact() passes to permute().
+    m.permute({0, 2});
+
+    EXPECT(collect_range_i64(m, 0, 0, 100) == std::vector<InternalId>({0, 1}));
+    EXPECT(collect_range_i64(m, 0, 15, 25).empty());  // old id 1's value (20) is gone
+}
+
+TEST(snapshot_round_trip_rebuilds_the_index) {
+    MetadataStore m(indexed_schema());
+    for (int i = 0; i < 5; ++i) {
+        m.append_row(indexed_row((i + 1) * 10, (i + 1) + 0.5, "cat" + std::to_string(i)));
+        m.mark_live(static_cast<InternalId>(i));
+    }
+    m.mark_dead(2);  // price=30 dies
+
+    std::vector<uint8_t> bytes_out;
+    m.serialize(bytes_out);
+
+    // Counts/postings/the index are derived, not part of the serialized bytes — this
+    // only proves anything if rebuild_derived_state()'s pass over the index actually
+    // ran, the same as it already does for count/postings.
+    MetadataStore restored(indexed_schema());
+    Reader        r(bytes_out.data(), bytes_out.size());
+    restored.deserialize(r);
+    std::vector<bool> deleted(5, false);
+    deleted[2] = true;
+    restored.rebuild_derived_state(deleted);
+
+    EXPECT(collect_range_i64(restored, 0, 0, 100) == std::vector<InternalId>({0, 1, 3, 4}));
+    EXPECT(collect_range_i64(restored, 0, 25, 35).empty());  // dead row 2's value (30)
+}
+
 TEST(metadata_rejects_schema_violations) {
     MetadataStore m(demo_schema());
 
