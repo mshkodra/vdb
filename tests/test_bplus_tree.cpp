@@ -4,9 +4,12 @@
 #include "sortable_bits.h"
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <random>
 #include <set>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 using namespace vdb;
@@ -481,5 +484,138 @@ TEST(bplus_tree_randomized_insert_remove_churn_matches_oracle) {
             }
             EXPECT(t.size() == total);
         }
+    }
+}
+
+// --- concurrency (insert()/find()/range() only — see the class comment for why
+// remove() isn't part of this) ------------------------------------------------
+
+TEST(bplus_tree_max_nodes_is_enforced) {
+    // Mirrors HNSWIndex's identical test for max_elements: past the fixed
+    // reserve, insert() must throw rather than let nodes_ reallocate, which
+    // would invalidate any lock a concurrent reader is holding into the arena.
+    BTreeConfig cfg;
+    cfg.node_capacity = 2;  // tiny: a handful of inserts forces several splits
+    cfg.max_nodes      = 3;  // room for the initial leaf plus one split, no more
+    BPlusTree t(cfg);
+    bool threw = false;
+    try {
+        for (uint64_t k = 0; k < 100; ++k) t.insert(k, static_cast<InternalId>(k));
+    } catch (const std::length_error&) {
+        threw = true;
+    }
+    EXPECT(threw);
+}
+
+TEST(bplus_tree_concurrent_insert_all_present) {
+    // T threads pull work off a shared atomic counter (same pattern
+    // test_concurrency.cpp uses for HNSWIndex) and each insert their own share of
+    // N ids, all under one BPlusTree. A small node_capacity and a small key range
+    // relative to N means splits, borrows, and heavy duplicate density are all
+    // common during the run, not edge cases — this is deliberately close to the
+    // exact workload (bplus_tree_insert_only_survives_duplicate_separators_in_one_parent)
+    // that found the real single-threaded bug this stage's insert() had to work
+    // around; running it concurrently is what the B-link protocol exists for.
+    constexpr size_t N = 20000, T = 8;
+    constexpr uint64_t kKeyRange = 500;
+    BTreeConfig cfg;
+    cfg.node_capacity = 8;
+    BPlusTree t(cfg);
+
+    std::atomic<size_t> next{0};
+    auto worker = [&] {
+        size_t i;
+        while ((i = next.fetch_add(1)) < N) t.insert(i % kKeyRange, static_cast<InternalId>(i));
+    };
+    std::vector<std::thread> threads;
+    for (size_t k = 0; k < T; ++k) threads.emplace_back(worker);
+    for (auto& th : threads) th.join();
+
+    EXPECT(t.size() == N);
+    for (uint64_t key = 0; key < kKeyRange; ++key) {
+        auto found = t.find(key);
+        std::sort(found.begin(), found.end());
+        std::vector<InternalId> want;
+        for (size_t i = key; i < N; i += kKeyRange) want.push_back(static_cast<InternalId>(i));
+        ASSERT(found == want);
+    }
+}
+
+TEST(bplus_tree_concurrent_insert_with_concurrent_reads_is_sound) {
+    // Reader threads run find()/range() the whole time insert threads are
+    // running, on the same tree. What a read observes mid-flight is a moving
+    // target by design (an id inserted a moment ago may or may not be visible
+    // yet) — this test doesn't assert *what* a concurrent read sees, only that
+    // it's never wrong: every (key, id) a read returns must be one that's
+    // actually being inserted under exactly that key, never a garbage value or
+    // an id attributed to the wrong key (which is exactly what a corrupted split
+    // or a torn read would produce). The real judge of "no data race" is tsan
+    // (make test-tsan), not this test's own assertions — this just gives tsan
+    // something to watch.
+    constexpr size_t N = 20000;
+    constexpr size_t kInsertThreads = 4;
+    constexpr size_t kReaderThreads = 4;
+    constexpr uint64_t kKeyRange = 300;
+    BTreeConfig cfg;
+    cfg.node_capacity = 8;
+    BPlusTree t(cfg);
+
+    std::atomic<size_t> next{0};
+    std::atomic<bool>   stop{false};
+    std::atomic<size_t> violations{0};
+
+    auto inserter = [&] {
+        size_t i;
+        while ((i = next.fetch_add(1)) < N) t.insert(i % kKeyRange, static_cast<InternalId>(i));
+    };
+    auto check_pair = [&](uint64_t key, InternalId id) {
+        if (id >= N || static_cast<uint64_t>(id) % kKeyRange != key)
+            violations.fetch_add(1, std::memory_order_relaxed);
+    };
+    auto find_reader = [&](unsigned seed) {
+        std::mt19937_64 rng(seed);
+        std::uniform_int_distribution<uint64_t> key_dist(0, kKeyRange - 1);
+        while (!stop.load(std::memory_order_relaxed)) {
+            const uint64_t key = key_dist(rng);
+            for (InternalId id : t.find(key)) check_pair(key, id);
+        }
+    };
+    auto range_reader = [&](unsigned seed) {
+        std::mt19937_64 rng(seed);
+        std::uniform_int_distribution<uint64_t> bound_dist(0, kKeyRange - 1);
+        while (!stop.load(std::memory_order_relaxed)) {
+            uint64_t lo = bound_dist(rng), hi = bound_dist(rng);
+            if (lo > hi) std::swap(lo, hi);
+            uint64_t last_key = 0;
+            bool     have_last = false;
+            t.range(lo, hi, [&](uint64_t k, InternalId id) {
+                check_pair(k, id);
+                if (have_last && k < last_key) violations.fetch_add(1, std::memory_order_relaxed);
+                last_key  = k;
+                have_last = true;
+            });
+        }
+    };
+
+    std::vector<std::thread> readers;
+    for (size_t k = 0; k < kReaderThreads; ++k) {
+        if (k % 2 == 0) readers.emplace_back(find_reader, static_cast<unsigned>(k + 1));
+        else            readers.emplace_back(range_reader, static_cast<unsigned>(k + 1));
+    }
+    std::vector<std::thread> inserters;
+    for (size_t k = 0; k < kInsertThreads; ++k) inserters.emplace_back(inserter);
+    for (auto& th : inserters) th.join();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& th : readers) th.join();
+
+    EXPECT(violations.load() == 0);
+    EXPECT(t.size() == N);
+
+    for (uint64_t key = 0; key < kKeyRange; ++key) {
+        auto found = t.find(key);
+        std::sort(found.begin(), found.end());
+        std::vector<InternalId> want;
+        for (size_t i = key; i < N; i += kKeyRange) want.push_back(static_cast<InternalId>(i));
+        ASSERT(found == want);
     }
 }
