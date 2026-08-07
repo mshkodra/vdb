@@ -18,10 +18,8 @@ struct BTreeConfig {
 };
 
 // A B+-tree keyed on a pre-transformed sortable uint64_t (see sortable_bits.h) ->
-// InternalId, for one numeric (Int64/Float64) column's secondary index. This PR is
-// point lookup and insert-with-splitting only: single-threaded (concurrency is a
-// later stage, B-link/Lehman-Yao) and insert-only (delete/merge-on-underflow is a
-// later stage too).
+// InternalId, for one numeric (Int64/Float64) column's secondary index. Single-
+// threaded — concurrency (B-link/Lehman-Yao) is a later stage.
 //
 // It's a B **+** -tree, not a plain B-tree: only leaves hold values (InternalId).
 // Internal nodes hold nothing but separator keys and child pointers, purely to route
@@ -44,6 +42,15 @@ public:
     explicit BPlusTree(BTreeConfig cfg = {});
 
     void insert(uint64_t key, InternalId id);
+
+    // Removes the one entry matching both `key` and `id` exactly (duplicates mean
+    // key alone doesn't identify a row — an update or a delete needs to remove a
+    // *specific* row's entry, not an arbitrary one sharing its value). Returns
+    // false, no change, if that exact pair isn't present. Rebalances (borrow from a
+    // sibling, or merge with one) if the removal leaves a node under half full —
+    // the mirror image of insert()'s split, and not a simple inverse of it: see
+    // rebalance_after_erase_'s comment for why.
+    bool remove(uint64_t key, InternalId id);
 
     // Every id stored under exactly `key`, across as many leaves as it takes.
     std::vector<InternalId> find(uint64_t key) const;
@@ -140,6 +147,60 @@ private:
     // and removed from both halves — an internal separator exists only to route,
     // so once it's promoted it has no reason to also stay behind.
     SplitResult split_internal_(NodeId id);
+
+    // --- delete / rebalance ------------------------------------------------
+    // No allocation happens anywhere below (no new_leaf_/new_internal_ calls), so
+    // unlike split_leaf_/split_internal_, these never need to re-fetch a Node&
+    // after taking it — nodes_ never grows during a remove().
+
+    // `child`'s index within `parent.children` (linear scan; children.size() <=
+    // node_capacity + 1, so this is cheap — no parent-index is cached on the child
+    // the way it would be with actual parent pointers).
+    size_t child_position_(const Node& parent, NodeId child) const;
+
+    // Moves (path, cur) to the leaf immediately after cur in left-to-right order,
+    // keeping path a valid ancestor chain for the new cur. remove() needs this
+    // because the leaf a normal descent reaches isn't necessarily the one holding
+    // the specific id being removed — the same duplicates-spanning-a-split
+    // situation find()/range() handle by walking next_leaf, except here the walk
+    // also has to keep the path a later rebalance depends on in sync, which
+    // next_leaf alone doesn't give you. False if cur was already the last leaf.
+    bool advance_to_next_leaf_(std::vector<NodeId>& path, NodeId& cur) const;
+
+    // After an entry has been erased from the leaf `node` (found via `path`,
+    // node's ancestors root-first), restores the >= half-full invariant if `node`
+    // dropped below it — borrowing one entry from a sibling that can spare it, or
+    // merging with one that can't, cascading up through `path` if a merge leaves
+    // an ancestor underfull too, and collapsing the root by one level if it merges
+    // down to a single child.
+    //
+    // This is not simply "insert()'s split in reverse": a split only ever needs to
+    // know about the *one* node overflowing, but fixing an underflow needs a
+    // sibling — which means going through the parent, since (unlike leaves) an
+    // internal node keeps no sibling pointer of its own. That's also why this
+    // takes the full path rather than working the way split_leaf_/split_internal_
+    // do (operate on one node, hand the caller a result to place one level up):
+    // every level here needs its parent in hand to find, and rewrite, a sibling.
+    void rebalance_after_erase_(std::vector<NodeId>& path, NodeId node);
+
+    // Steals one entry from a sibling that has more than the minimum, so `node`
+    // (parent.children[ci]) reaches the minimum without cutting into the sibling's
+    // own floor. Only the separator in `parent` moves for a leaf-level borrow (the
+    // stolen entry becomes node's new min or max); an internal-level borrow
+    // rotates through `parent` — the old separator descends into node, the
+    // sibling's outermost key ascends to replace it — because an internal
+    // separator isn't itself owned by any child the way a leaf entry is.
+    void borrow_from_right_(Node& parent, size_t ci);
+    void borrow_from_left_(Node& parent, size_t ci);
+
+    // Absorbs parent.children[ci + 1] into parent.children[ci] and removes the
+    // pair (separator, right child) from parent — the only option once neither
+    // sibling can spare an entry. For an internal merge, the separator between
+    // them is *pulled down* into the merged node (mirroring split_internal_'s
+    // promotion in reverse): it's the only thing that used to distinguish "reached
+    // via the left child" from "reached via the right child", and the merged node
+    // still needs that distinction internally now that it has both children.
+    void merge_with_right_(Node& parent, size_t ci);
 };
 
 }
