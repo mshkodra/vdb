@@ -66,6 +66,21 @@ void BPlusTree::move_right_(NodeId& cur, std::unique_lock<std::mutex>& lock, uin
     }
 }
 
+void BPlusTree::move_right_to_child_(NodeId& cur, std::unique_lock<std::mutex>& lock,
+                                     NodeId target) const {
+    while (std::find(nodes_[cur].children.begin(), nodes_[cur].children.end(), target) ==
+           nodes_[cur].children.end()) {
+        const NodeId right = nodes_[cur].right_link;
+        // No right_link left and target still not found: target has been lost,
+        // not merely relocated — a real corruption, not the ordinary staleness
+        // this function exists to correct. See the class comment.
+        assert(right != kNoNext);
+        std::unique_lock<std::mutex> right_lock(*nodes_[right].mutex);
+        lock = std::move(right_lock);  // unlocks cur's old lock before cur itself changes
+        cur = right;
+    }
+}
+
 void BPlusTree::descend_locked_(NodeId& cur, std::unique_lock<std::mutex>& lock,
                                 uint64_t key) const {
     for (;;) {
@@ -105,10 +120,13 @@ void BPlusTree::insert(uint64_t key, InternalId id) {
 
     // Splice (separator, right) into promoted_child's parent, cascading upward if
     // that parent overflows too. See the class comment for why this follows
-    // parent_hint (self-corrected via move_right_) rather than searching for the
-    // parent by value: with duplicate-heavy data, more than one node can share
-    // the exact separator value, so a value-only search has no reliable way to
-    // tell which one is actually the right parent.
+    // parent_hint (self-corrected via move_right_to_child_, an *identity* search)
+    // rather than searching for the parent by value: with duplicate-heavy data,
+    // more than one node can share the exact separator value, so a value-only
+    // search has no reliable way to tell which one is actually the right parent —
+    // and, as importantly, a value comparison against sr.separator specifically
+    // isn't even the right test here, since promoted_child's own separator can
+    // legitimately exceed its parent's high_key (see the class comment).
     for (;;) {
         NodeId parent_id;
         std::unique_lock<std::mutex> parent_lock;
@@ -116,7 +134,7 @@ void BPlusTree::insert(uint64_t key, InternalId id) {
         if (hint != kNoNext) {
             parent_id   = hint;
             parent_lock = std::unique_lock<std::mutex>(*nodes_[parent_id].mutex);
-            move_right_(parent_id, parent_lock, sr.separator);
+            move_right_to_child_(parent_id, parent_lock, promoted_child);
         } else {
             // No hint: promoted_child either is the current root, or some other
             // writer's cascade is mid-way through growing a new root over it
@@ -158,14 +176,17 @@ void BPlusTree::insert(uint64_t key, InternalId id) {
             hint        = fresh_hint;
             parent_id   = hint;
             parent_lock = std::unique_lock<std::mutex>(*nodes_[parent_id].mutex);
-            move_right_(parent_id, parent_lock, sr.separator);
+            move_right_to_child_(parent_id, parent_lock, promoted_child);
         }
 
         Node& p = nodes_[parent_id];
         // Find promoted_child's own slot by *identity*, not by routing
         // sr.separator through p as a value — see the class comment: those agree
         // only when sr.separator happens to be the first matching key in p, and
-        // duplicate-heavy data routinely breaks that assumption.
+        // duplicate-heavy data routinely breaks that assumption. (move_right_to_child_
+        // just above already located p by promoted_child's identity, but that only
+        // gets us to the right *node* — still need this node's own child *index*
+        // to insert at.)
         const size_t ci = child_position_(p, promoted_child);
         p.keys.insert(p.keys.begin() + static_cast<long>(ci), sr.separator);
         p.children.insert(p.children.begin() + static_cast<long>(ci) + 1, sr.right);

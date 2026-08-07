@@ -76,12 +76,25 @@ struct BTreeConfig {
 //     rewritten to avoid it). Instead, every node carries a parent_hint, set once
 //     when it's first spliced into a parent and never updated after. Finding a
 //     node's current parent means following that hint and correcting it for
-//     staleness with the same high_key check move_right_ always uses: did *this
-//     one, already-identified* node split since the hint was set, and if so, which
-//     side did our node land on. That's unambiguous (unlike "where in the whole
-//     tree does this value belong") because it's about one specific node's own
-//     split, never a search among possibly-many candidates sharing a value. A node
-//     with no hint yet (kNoNext) either is the current root, or is about to be
+//     staleness — but the correction has to be an *identity* search
+//     (move_right_to_child_: keep hopping right while the child isn't among the
+//     current node's own children), not a value comparison against high_key. An
+//     earlier version of this code used the high_key check here (the same one
+//     move_right_ uses for ordinary ROUTE-BY-VALUE descent) and that is the wrong
+//     question for this job: "does this node's key range cover the value I'm about
+//     to splice in" and "does this node still hold my child" can disagree — a
+//     child that has itself grown past its parent's high_key (via its own later
+//     splits, correctly re-spliced back into that same parent each time) is a
+//     legitimate state, and a value check on the *new* separator being spliced can
+//     fail even though the identity check would immediately succeed. That
+//     divergence caused real, reproducible tree corruption under concurrent
+//     duplicate-heavy inserts. The identity search is still unambiguous the same
+//     way the old value-based one was meant to be (unlike "where in the whole tree
+//     does this value belong"): it's always about one specific, already-identified
+//     node's own subsequent splits, never a search among possibly-many candidates
+//     sharing a value — a child only ever moves rightward, one hop per split of its
+//     parent, so walking right by identity from a stale hint always terminates. A
+//     node with no hint yet (kNoNext) either is the current root, or is about to be
 //     given one by whichever writer is mid-way through growing a new root over
 //     it — insert() distinguishes the two by checking root_ itself.
 //   - Every node has its own mutex, and at most one is ever held at a time: a
@@ -257,8 +270,26 @@ private:
     // While `cur`'s high_key says `key` belongs further right, hops to right_link,
     // locking the neighbor before releasing cur's own lock (so at most one lock is
     // held at the instant of the hop, never held across it) — the self-correction
-    // step that makes a stale idea of "which node covers key" safe to act on.
+    // step that makes a stale idea of "which node covers key" safe to act on. Used
+    // for ordinary route-by-value traversal (find()/range()/descend_locked_'s own
+    // per-level correction) — *not* for relocating a promoted child's parent; see
+    // move_right_to_child_ for why that's a different question with a different
+    // answer.
     void move_right_(NodeId& cur, std::unique_lock<std::mutex>& lock, uint64_t key) const;
+
+    // While `target` isn't among `cur`'s own children, hops to right_link — same
+    // one-lock-at-a-time handoff as move_right_, but the stopping test is identity
+    // ("is `target` here"), not value ("does high_key cover this key"). This is
+    // what insert()'s cascade uses to relocate a promoted child's current parent
+    // after a stale parent_hint: the question there is purely "which node holds
+    // *this specific child* now", and a value comparison against the child's own
+    // new separator can disagree with that (a child can legitimately grow past its
+    // parent's high_key across its own later splits, each correctly re-spliced
+    // into the same parent) — see the class comment. A child only ever moves
+    // rightward, one hop per split of its parent, so this always terminates by
+    // finding it; reaching a node with no right_link and still not finding it is a
+    // real corruption, not a staleness case, hence the assert rather than a retry.
+    void move_right_to_child_(NodeId& cur, std::unique_lock<std::mutex>& lock, NodeId target) const;
 
     // Descends from an already-locked, already-move_right_'d `cur` to the leaf that
     // would hold `key`, locking one child at a time and releasing each parent
