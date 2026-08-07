@@ -1,11 +1,14 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "bplus_tree.h"
 #include "serialize.h"
+#include "sortable_bits.h"
 #include "vdb_types.h"
 
 namespace vdb {
@@ -179,6 +182,31 @@ public:
         return code < p.size() ? p[code] : empty;
     }
 
+    // Every *live* InternalId whose column `attr` holds a value in [lo, hi]
+    // (inclusive), in ascending key order, via emit(id) — a callback rather than a
+    // materialized vector for the same reason BPlusTree::range() is, one level
+    // down. Only meaningful for an `indexed` Int64/Float64 column; a no-op call on
+    // any other column (same lenient contract postings()/count() already have for
+    // an argument that doesn't apply — no throw, just nothing to report).
+    //
+    // Unlike postings(), this index holds exactly the live rows, not an
+    // append-only superset: insert() runs at mark_live, remove() at mark_dead, and
+    // a remove+insert pair at set_row's overwrite. That costs a real B+-tree
+    // remove() (descent plus a possible rebalance) on every delete/overwrite of an
+    // indexed column, instead of postings' O(1) append — paid because a stale
+    // entry here would both slow the range scan that has to walk past it and
+    // corrupt the exact-selectivity number a future cost-based planner (PR 10)
+    // needs from a range query, the same wart postings.size() already has and
+    // count() exists to route around.
+    template <class Emit>
+    void range(size_t attr, int64_t lo, int64_t hi, Emit&& emit) const {
+        range_(attr, sortable_bits(lo), sortable_bits(hi), std::forward<Emit>(emit));
+    }
+    template <class Emit>
+    void range(size_t attr, double lo, double hi, Emit&& emit) const {
+        range_(attr, sortable_bits(lo), sortable_bits(hi), std::forward<Emit>(emit));
+    }
+
     void serialize(std::vector<uint8_t>& out) const;
     void deserialize(Reader& r);
 
@@ -202,6 +230,16 @@ private:
         // value, in no particular order. Same shape as `count` (dict-sized for Tag,
         // size 2 for Bool) but append-only — see the public postings() accessor.
         std::vector<std::vector<InternalId>> postings;
+
+        // indexed Int64/Float64 only, null otherwise: keyed on sortable_bits(value),
+        // holding InternalId. unique_ptr, not BPlusTree by value, because BPlusTree
+        // isn't movable (its per-tree mutexes are direct members, like Node::mutex
+        // one level down forces a unique_ptr there too) — and columns_ has to stay a
+        // plain, resizable std::vector<Column>. Not part of the serialized snapshot
+        // bytes (derived state, same as count/postings): rebuilt from scratch in
+        // rebuild_derived_state()/permute()/clear_rows(), same call sites and same
+        // reason those already rebuild postings.
+        std::unique_ptr<BPlusTree> index;
     };
 
     // Tag/Bool columns only, no-op otherwise: if row `id` is present in column `a`,
@@ -212,6 +250,26 @@ private:
     // Tag/Bool columns only, no-op otherwise: if row `id` is present in column `a`,
     // append it to that value's postings list. Never removes — see postings().
     void add_posting_(size_t a, InternalId id);
+
+    // indexed Int64/Float64 columns only, no-op otherwise: if row `id` is present in
+    // column `a`, insert (increment=true) or remove (increment=false) it from that
+    // column's B+-tree, keyed on its *current* c.data[id] at call time — so a caller
+    // removing an old value must call this *before* overwriting c.data[id], the same
+    // before/after dance adjust_count_ already requires (see set_row).
+    void adjust_index_(size_t a, InternalId id, bool increment);
+
+    // Int64/Float64 only (asserts otherwise — every caller already knows the column's
+    // declared type): c.data[id]'s raw bits, reinterpreted as the declared type and
+    // run through sortable_bits(). The one place a Column's raw uint64_t storage gets
+    // turned into a B+-tree key.
+    uint64_t sortable_key_(const Column& c, InternalId id) const;
+
+    template <class Emit>
+    void range_(size_t attr, uint64_t lo, uint64_t hi, Emit&& emit) const {
+        const Column& c = columns_[attr];
+        if (!c.index) return;
+        c.index->range(lo, hi, [&](uint64_t /*key*/, InternalId id) { emit(id); });
+    }
 
     uint32_t intern_(Column& c, const std::string& s);
     void     compute_fingerprint_();

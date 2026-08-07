@@ -39,6 +39,7 @@ MetadataStore::MetadataStore(std::vector<AttrSpec> schema) : schema_(std::move(s
             columns_[a].count.assign(2, 0);
             columns_[a].postings.assign(2, {});
         }
+        if (schema_[a].indexed) columns_[a].index = std::make_unique<BPlusTree>();
     }
     compute_fingerprint_();
 }
@@ -106,25 +107,53 @@ void MetadataStore::add_posting_(size_t a, InternalId id) {
     c.postings[code].push_back(id);
 }
 
+uint64_t MetadataStore::sortable_key_(const Column& c, InternalId id) const {
+    return c.type == AttrType::Int64 ? sortable_bits(int_from_bits(c.data[id]))
+                                      : sortable_bits(double_from_bits(c.data[id]));
+}
+
+// indexed columns only; a no-op for any other column or an absent value. Reads
+// c.data[id] at call time, so — unlike adjust_count_, which only *reads* the code
+// to increment/decrement a count — a caller removing an old value must call this
+// before overwriting c.data[id] (see set_row).
+void MetadataStore::adjust_index_(size_t a, InternalId id, bool increment) {
+    Column& c = columns_[a];
+    if (!c.index || !c.present[id]) return;
+    const uint64_t key = sortable_key_(c, id);
+    if (increment) c.index->insert(key, id);
+    else           c.index->remove(key, id);
+}
+
 void MetadataStore::mark_live(InternalId id) {
-    for (size_t a = 0; a < columns_.size(); ++a) adjust_count_(a, id, /*increment=*/true);
+    for (size_t a = 0; a < columns_.size(); ++a) {
+        adjust_count_(a, id, /*increment=*/true);
+        adjust_index_(a, id, /*increment=*/true);
+    }
 }
 
 void MetadataStore::mark_dead(InternalId id) {
-    for (size_t a = 0; a < columns_.size(); ++a) adjust_count_(a, id, /*increment=*/false);
+    for (size_t a = 0; a < columns_.size(); ++a) {
+        adjust_count_(a, id, /*increment=*/false);
+        adjust_index_(a, id, /*increment=*/false);
+    }
 }
 
 void MetadataStore::rebuild_derived_state(const std::vector<bool>& deleted) {
     for (auto& c : columns_) {
-        if (c.type != AttrType::Tag && c.type != AttrType::Bool) continue;
-        std::fill(c.count.begin(), c.count.end(), 0u);
-        for (auto& p : c.postings) p.clear();
+        if (c.type == AttrType::Tag || c.type == AttrType::Bool) {
+            std::fill(c.count.begin(), c.count.end(), 0u);
+            for (auto& p : c.postings) p.clear();
+        }
+        // Fresh, empty tree rather than an O(k) walk removing every entry — same
+        // "rebuild from scratch" call this function already makes for count/postings.
+        if (c.index) c.index = std::make_unique<BPlusTree>();
     }
 
     for (InternalId id = 0; id < rows_; ++id) {
         if (deleted[id]) continue;
         for (size_t a = 0; a < columns_.size(); ++a) {
             adjust_count_(a, id, /*increment=*/true);
+            adjust_index_(a, id, /*increment=*/true);
             add_posting_(a, id);
         }
     }
@@ -181,6 +210,7 @@ void MetadataStore::set_row(InternalId id, const Record& rec) {
     // already counted — drop it before overwriting, add the new value back after.
     for (size_t a = 0; a < columns_.size(); ++a) {
         adjust_count_(a, id, /*increment=*/false);
+        adjust_index_(a, id, /*increment=*/false);
         Column& c = columns_[a];
         if (rec.attrs.empty() || rec.attrs[a].is_null()) {
             c.data[id]    = 0;
@@ -191,6 +221,7 @@ void MetadataStore::set_row(InternalId id, const Record& rec) {
             c.present[id] = true;
         }
         adjust_count_(a, id, /*increment=*/true);
+        adjust_index_(a, id, /*increment=*/true);
         // The old value's postings entry (if any) goes stale, not removed — same
         // lazy-cleanup story as add_posting_ everywhere else.
         add_posting_(a, id);
@@ -221,6 +252,17 @@ void MetadataStore::permute(const std::vector<InternalId>& live) {
                 if (c.present[new_id])
                     c.postings[static_cast<uint32_t>(c.data[new_id])].push_back(new_id);
         }
+
+        // Same reason and same fresh-then-repopulate shape as postings just above:
+        // the InternalIds an indexed column's B+-tree holds are exactly what
+        // renumbers here, so remapping the old tree in place isn't an option —
+        // rebuild it against the new numbering (which c.data/c.present, read below,
+        // already carry, from the swap above).
+        if (c.index) {
+            c.index = std::make_unique<BPlusTree>();
+            for (InternalId new_id = 0; new_id < c.present.size(); ++new_id)
+                if (c.present[new_id]) c.index->insert(sortable_key_(c, new_id), new_id);
+        }
     }
 
     std::vector<std::vector<uint8_t>> payload;
@@ -240,6 +282,7 @@ void MetadataStore::clear_rows() {
         // every code that existed still exists, it just has no live rows right now.
         std::fill(c.count.begin(), c.count.end(), 0u);
         for (auto& p : c.postings) p.clear();
+        if (c.index) c.index = std::make_unique<BPlusTree>();
     }
     payload_.clear();
     rows_ = 0;
