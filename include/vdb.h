@@ -106,6 +106,14 @@ public:
     // Same search, but each hit carries its distance and a copy of its payload.
     std::vector<Hit> search_hits(const float* query, size_t K) const;
 
+    // Post-filtered search: run the index as usual, then keep only live hits that
+    // also match `pred`. `pred` is resolved once (MetadataStore::resolve) before the
+    // hot loop, not re-dispatched per candidate. Throws std::invalid_argument if
+    // `pred` doesn't resolve to an allowlist (a range on a non-`indexed` column) —
+    // that per-candidate case isn't supported yet.
+    std::vector<ExternalId> search(const float* query, size_t K, const Predicate& pred) const;
+    std::vector<Hit> search_hits(const float* query, size_t K, const Predicate& pred) const;
+
     // Rebuild the index from live vectors only, reclaiming tombstoned space.
     // External ids are preserved; internal ids are renumbered.
     void compact();
@@ -168,11 +176,13 @@ private:
     // Shared body of the two update() overloads; null `meta` carries the old row over.
     bool update_(ExternalId id, const float* vec, const Record* meta);
 
-    // Shared body of the two search paths: run the index, drop tombstones, and hand
-    // each surviving (internal id, distance) to `emit` until K have been taken.
+    // Shared body of the four search paths: run the index, drop tombstones (and,
+    // if `pred` is given, non-matches), and hand each surviving (internal id,
+    // distance) to `emit` until K have been taken. `pred` must already be resolved
+    // (MetadataStore::resolve) — collect_ never dispatches on predicate kind itself.
     // Caller must hold mu_ (shared is enough).
     template <class Emit>
-    void collect_(const float* query, size_t K, Emit&& emit) const;
+    void collect_(const float* query, size_t K, Emit&& emit, const ResolvedPredicate* pred = nullptr) const;
 
     static std::unique_ptr<Index> make_index_(const VDBConfig& cfg);
 };

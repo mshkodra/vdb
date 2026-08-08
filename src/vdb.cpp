@@ -201,22 +201,34 @@ bool VDB::get_metadata(ExternalId id, Record& out) const {
 // Caller holds mu_. Templated on the sink so the emit call inlines — the same
 // reasoning as the distance functors: this loop must not pay an indirect call.
 template <class Emit>
-void VDB::collect_(const float* query, size_t K, Emit&& emit) const {
-    // Tombstoned hits are dropped after the index returns them, so ask for enough
-    // extra to still land K live results. K + deleted_count_ is exact for the
-    // brute oracle (worst case: every tombstone ranks ahead of the live top-K)
-    // and a safe over-fetch for the ANN indexes. Unbounded tombstone growth is
-    // the pressure that motivates compact().
+void VDB::collect_(const float* query, size_t K, Emit&& emit, const ResolvedPredicate* pred) const {
+    // Tombstoned hits (and, with a predicate, non-matches) are dropped after the
+    // index returns them, so ask for enough extra to still land K live results.
+    // Unbounded tombstone growth is the pressure that motivates compact().
     //
     // This over-fetch is a *post-filter* margin, and it only stays bounded because
-    // the predicate is "is live". A general attribute predicate matching fraction s
-    // would need K + N(1-s), i.e. a full scan — which is why filtered search needs
-    // more than post-filtering.
-    const size_t want = std::min(K + deleted_count_, index_->size());
+    // the predicate is exact and resolved up front. A predicate matching fraction s
+    // of the db needs K + N(1-s) — with no predicate that's K + deleted_count_
+    // (s = live fraction); with one, `pred->allowlist` (already live-only) gives the
+    // exact match count, so K + (index_->size() - allowlist->size()) is exact too.
+    std::vector<bool> in_allowlist;
+    size_t want;
+    if (pred) {
+        if (!pred->allowlist)
+            throw std::invalid_argument(
+                "collect_: predicate did not resolve to an allowlist (range on a "
+                "non-indexed column) — per-candidate evaluation isn't supported yet");
+        want = std::min(K + (index_->size() - pred->allowlist->size()), index_->size());
+        in_allowlist.assign(index_->size(), false);
+        for (InternalId id : *pred->allowlist) in_allowlist[id] = true;
+    } else {
+        want = std::min(K + deleted_count_, index_->size());
+    }
 
     size_t taken = 0;
     for (auto& [iid, dist] : index_->search(query, want)) {
         if (deleted_[iid]) continue;
+        if (pred && !in_allowlist[iid]) continue;
         emit(iid, dist);
         if (++taken == K) break;
     }
@@ -248,6 +260,32 @@ std::vector<Hit> VDB::search_hits(const float* query, size_t K) const {
     collect_(query, K, [&](InternalId iid, float dist) {
         out.push_back(Hit{int_to_ext_[iid], dist, meta_.payload(iid)});
     });
+    return out;
+}
+
+std::vector<ExternalId> VDB::search(const float* query, size_t K, const Predicate& pred) const {
+    if (K == 0) return {};
+    std::shared_lock<std::shared_mutex> lk(mu_);
+
+    ResolvedPredicate resolved = meta_.resolve(pred, deleted_);
+    std::vector<ExternalId> out;
+    out.reserve(K);
+    collect_(
+        query, K, [&](InternalId iid, float) { out.push_back(int_to_ext_[iid]); }, &resolved);
+    return out;
+}
+
+std::vector<Hit> VDB::search_hits(const float* query, size_t K, const Predicate& pred) const {
+    if (K == 0) return {};
+    std::shared_lock<std::shared_mutex> lk(mu_);
+
+    ResolvedPredicate resolved = meta_.resolve(pred, deleted_);
+    std::vector<Hit> out;
+    out.reserve(K);
+    collect_(
+        query, K,
+        [&](InternalId iid, float dist) { out.push_back(Hit{int_to_ext_[iid], dist, meta_.payload(iid)}); },
+        &resolved);
     return out;
 }
 
