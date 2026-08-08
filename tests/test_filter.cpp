@@ -3,6 +3,10 @@
 // "Post-filter"). Run the index as usual, then keep only live hits matching the
 // predicate too; the over-fetch margin is exact because ResolvedPredicate::allowlist
 // is already live-filtered.
+//
+// PR 12: pre-filter — VDB::search_prefiltered/search_hits_prefiltered, which skip
+// index_ entirely and brute-force scan just the allowlist (docs/plans/PR_STACK.md
+// #12, docs/plans/FILTER_STRATEGY.md "Pre-filter").
 
 #include "test.h"
 
@@ -184,5 +188,125 @@ TEST(post_filter_over_fetch_finds_selective_match_through_hnsw) {
     const auto want = oracle(target_live, {q[0], q[1]}, 1);
     const auto got  = db.search(q, 1, pred_eq(0, attr_tag("target")));
     ASSERT(got.size() == 1);
+    EXPECT(got == want);
+}
+
+TEST(prefilter_eq_returns_only_matching_live_hits_nearest_first) {
+    VDB db(filter_config(IndexKind::Brute, 2));
+    const float q[2] = {0.0f, 0.0f};
+    std::vector<std::pair<ExternalId, std::vector<float>>> shoes_live;
+
+    for (int i = 0; i < 3; ++i) {
+        const float v[2] = {0.1f * i, 0.1f * i};
+        db.insert(v, row("hats", 1, 1.0));
+    }
+    for (int i = 0; i < 3; ++i) {
+        const float v[2] = {1.0f + 0.1f * i, 1.0f + 0.1f * i};
+        const ExternalId id = db.insert(v, row("shoes", 1, 1.0));
+        shoes_live.push_back({id, {v[0], v[1]}});
+    }
+
+    const auto want = oracle(shoes_live, {q[0], q[1]}, 2);
+    const auto got  = db.search_prefiltered(q, 2, pred_eq(0, attr_tag("shoes")));
+    EXPECT(got == want);
+}
+
+TEST(prefilter_excludes_tombstoned_matches_even_though_they_are_in_the_allowlist) {
+    VDB db(filter_config(IndexKind::Brute, 2));
+    const float q[2] = {0.0f, 0.0f};
+
+    const ExternalId near_match = db.insert(q, row("shoes", 1, 1.0));
+    const float far[2] = {5.0f, 5.0f};
+    const ExternalId far_match = db.insert(far, row("shoes", 1, 1.0));
+
+    ASSERT(db.remove(near_match));  // still in the Tag postings list, just dead
+
+    const auto got = db.search_prefiltered(q, 5, pred_eq(0, attr_tag("shoes")));
+    EXPECT(got == std::vector<ExternalId>{far_match});
+}
+
+TEST(prefilter_range_on_indexed_column) {
+    VDB db(filter_config(IndexKind::Brute, 2));
+    const float q[2] = {0.0f, 0.0f};
+    std::vector<std::pair<ExternalId, std::vector<float>>> in_range;
+
+    for (int i = 0; i < 6; ++i) {
+        const float v[2] = {static_cast<float>(i), static_cast<float>(i)};
+        const int64_t price = (i + 1) * 10;  // 10, 20, ..., 60
+        const ExternalId id = db.insert(v, row("x", price, 1.0));
+        if (price >= 20 && price <= 40) in_range.push_back({id, {v[0], v[1]}});
+    }
+
+    auto want = oracle(in_range, {q[0], q[1]}, 10);
+    auto got  = db.search_prefiltered(q, 10, pred_range(1, attr_int(20), attr_int(40)));
+    std::sort(want.begin(), want.end());
+    std::sort(got.begin(), got.end());
+    EXPECT(got == want);
+}
+
+TEST(prefilter_unresolved_range_on_non_indexed_column_throws) {
+    VDB db(filter_config(IndexKind::Brute, 2));
+    const float v[2] = {0.0f, 0.0f};
+    db.insert(v, row("x", 1, 5.0));
+
+    bool threw = false;
+    try {
+        db.search_prefiltered(v, 1, pred_range(2, attr_float(0.0), attr_float(10.0)));  // "score": not indexed
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT(threw);
+
+    threw = false;
+    try {
+        db.search_hits_prefiltered(v, 1, pred_range(2, attr_float(0.0), attr_float(10.0)));
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT(threw);
+}
+
+TEST(prefilter_search_hits_carries_payload_for_matching_hits_only) {
+    VDB db(filter_config(IndexKind::Brute, 2));
+    const float near_[2] = {0.0f, 0.0f};
+    const float far_[2]  = {9.0f, 9.0f};
+    const float q[2]     = {0.1f, 0.1f};
+
+    Record r1 = row("shoes", 1, 1.0);
+    r1.payload = {'n'};
+    Record r2 = row("hats", 1, 1.0);
+    r2.payload = {'f', 'a', 'r'};
+    db.insert(near_, r1);   // closer to q but wrong category
+    const ExternalId match = db.insert(far_, r2);
+
+    const auto hits = db.search_hits_prefiltered(q, 2, pred_eq(0, attr_tag("hats")));
+    ASSERT(hits.size() == 1);
+    EXPECT(hits[0].id == match);
+    EXPECT(hits[0].payload == std::vector<uint8_t>({'f', 'a', 'r'}));
+}
+
+// Pre-filter skips index_ entirely, so it must be exact even over HNSW, where a
+// selective predicate makes plain post-filter/graph traversal recall-lossy. This is
+// the case pre-filter is *for* (FILTER_STRATEGY.md: "wins when the matching set is
+// small") — same scene as the post-filter HNSW test above, but pre-filter must find
+// the true nearest match every time, not just "with high probability".
+TEST(prefilter_is_exact_over_hnsw_for_a_selective_predicate) {
+    VDB db(filter_config(IndexKind::HNSW, 2));
+    std::mt19937 rng(13);
+    std::normal_distribution<float> jitter(0.0f, 0.05f);
+
+    std::vector<std::pair<ExternalId, std::vector<float>>> target_live;
+    for (int c = 0; c < 4; ++c) {
+        for (int p = 0; p < 20; ++p) {
+            const float v[2] = {static_cast<float>(c) * 10.0f + jitter(rng),
+                                 static_cast<float>(c) * 10.0f + jitter(rng)};
+            const ExternalId id = db.insert(v, row(c == 3 ? "target" : "other", 1, 1.0));
+            if (c == 3) target_live.push_back({id, {v[0], v[1]}});
+        }
+    }
+
+    const float q[2] = {30.0f, 30.0f};  // centred on cluster 3 ("target")
+    const auto want = oracle(target_live, {q[0], q[1]}, 3);
+    const auto got  = db.search_prefiltered(q, 3, pred_eq(0, attr_tag("target")));
     EXPECT(got == want);
 }

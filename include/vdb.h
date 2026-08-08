@@ -114,6 +114,14 @@ public:
     std::vector<ExternalId> search(const float* query, size_t K, const Predicate& pred) const;
     std::vector<Hit> search_hits(const float* query, size_t K, const Predicate& pred) const;
 
+    // Pre-filtered search: skip index_ entirely, brute-force scan just `pred`'s
+    // (already live-filtered) allowlist. Wins over the post-filter overloads above
+    // when the predicate is selective; a distinct method rather than an automatic
+    // choice because that choice needs a cost model — PR 14's planner, not built yet.
+    // Same unresolved-predicate throw as the post-filter overloads.
+    std::vector<ExternalId> search_prefiltered(const float* query, size_t K, const Predicate& pred) const;
+    std::vector<Hit> search_hits_prefiltered(const float* query, size_t K, const Predicate& pred) const;
+
     // Rebuild the index from live vectors only, reclaiming tombstoned space.
     // External ids are preserved; internal ids are renumbered.
     void compact();
@@ -183,6 +191,19 @@ private:
     // Caller must hold mu_ (shared is enough).
     template <class Emit>
     void collect_(const float* query, size_t K, Emit&& emit, const ResolvedPredicate* pred = nullptr) const;
+
+    // Shared body of the two pre-filtered search paths: resolve `pred`, brute-force
+    // scan its allowlist (prefilter_scan_), and hand each (internal id, distance) to
+    // `emit`. Throws if `pred` doesn't resolve to an allowlist. Caller must hold mu_.
+    template <class Emit>
+    void collect_prefiltered_(const float* query, size_t K, const Predicate& pred, Emit&& emit) const;
+
+    // Brute-force `Metric`-correct distance over just `allowlist`'s vectors, nearest
+    // K first. Dispatches once on config_.metric to a templated inner loop (same
+    // pattern as make_for_metric/BruteIndex — no std::function in the hot loop).
+    // Caller must hold mu_; `allowlist` is assumed already live-filtered.
+    std::vector<std::pair<InternalId, float>> prefilter_scan_(
+        const float* query, size_t K, const std::vector<InternalId>& allowlist) const;
 
     static std::unique_ptr<Index> make_index_(const VDBConfig& cfg);
 };
