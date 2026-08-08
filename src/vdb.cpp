@@ -29,6 +29,30 @@ std::unique_ptr<Index> make_for_metric(Metric m, Arg&& arg) {
     }
     return nullptr;
 }
+
+// The pre-filter path's brute-force scan: same nth_element-then-sort shape as
+// BruteIndex<Dist>::search, just over `allowlist` instead of every row. `Dist` is
+// picked at compile time (this function is only ever instantiated with L2/
+// InnerProduct/Cosine below), so the distance loop inlines exactly as it does inside
+// BruteIndex itself.
+template <class Dist>
+std::vector<std::pair<InternalId, float>> prefilter_scan_impl(
+    const float* query, size_t K, size_t dim, const std::vector<InternalId>& allowlist,
+    const std::vector<std::vector<float>>& vectors) {
+    using Entry = std::pair<InternalId, float>;
+    Dist dist_;
+
+    std::vector<Entry> all;
+    all.reserve(allowlist.size());
+    for (InternalId iid : allowlist) all.push_back({iid, dist_(query, vectors[iid].data(), dim)});
+
+    auto by_distance = [](const Entry& a, const Entry& b) { return a.second < b.second; };
+    const size_t k = std::min(K, all.size());
+    std::nth_element(all.begin(), all.begin() + k, all.end(), by_distance);
+    all.resize(k);
+    std::sort(all.begin(), all.end(), by_distance);
+    return all;
+}
 }  // namespace
 
 std::unique_ptr<Index> VDB::make_index_(const VDBConfig& cfg) {
@@ -286,6 +310,52 @@ std::vector<Hit> VDB::search_hits(const float* query, size_t K, const Predicate&
         query, K,
         [&](InternalId iid, float dist) { out.push_back(Hit{int_to_ext_[iid], dist, meta_.payload(iid)}); },
         &resolved);
+    return out;
+}
+
+std::vector<std::pair<InternalId, float>> VDB::prefilter_scan_(
+    const float* query, size_t K, const std::vector<InternalId>& allowlist) const {
+    switch (config_.metric) {
+        case Metric::L2:
+            return prefilter_scan_impl<L2>(query, K, config_.dim, allowlist, vectors_);
+        case Metric::InnerProduct:
+            return prefilter_scan_impl<InnerProduct>(query, K, config_.dim, allowlist, vectors_);
+        case Metric::Cosine:
+            return prefilter_scan_impl<Cosine>(query, K, config_.dim, allowlist, vectors_);
+    }
+    return {};
+}
+
+template <class Emit>
+void VDB::collect_prefiltered_(const float* query, size_t K, const Predicate& pred, Emit&& emit) const {
+    ResolvedPredicate resolved = meta_.resolve(pred, deleted_);
+    if (!resolved.allowlist)
+        throw std::invalid_argument(
+            "collect_prefiltered_: predicate did not resolve to an allowlist (range on a "
+            "non-indexed column) — pre-filter needs a materialized match set");
+
+    for (auto& [iid, dist] : prefilter_scan_(query, K, *resolved.allowlist)) emit(iid, dist);
+}
+
+std::vector<ExternalId> VDB::search_prefiltered(const float* query, size_t K, const Predicate& pred) const {
+    if (K == 0) return {};
+    std::shared_lock<std::shared_mutex> lk(mu_);
+
+    std::vector<ExternalId> out;
+    out.reserve(K);
+    collect_prefiltered_(query, K, pred, [&](InternalId iid, float) { out.push_back(int_to_ext_[iid]); });
+    return out;
+}
+
+std::vector<Hit> VDB::search_hits_prefiltered(const float* query, size_t K, const Predicate& pred) const {
+    if (K == 0) return {};
+    std::shared_lock<std::shared_mutex> lk(mu_);
+
+    std::vector<Hit> out;
+    out.reserve(K);
+    collect_prefiltered_(query, K, pred, [&](InternalId iid, float dist) {
+        out.push_back(Hit{int_to_ext_[iid], dist, meta_.payload(iid)});
+    });
     return out;
 }
 
