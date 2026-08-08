@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -98,6 +99,65 @@ struct Record {
     std::vector<uint8_t>   payload;
 
     bool empty() const { return attrs.empty() && payload.empty(); }
+};
+
+// One filter condition on one declared attribute — the scope this stops at, on
+// purpose: Tag/Bool equality, or a numeric range, no conjunctions yet (see
+// docs/design/METADATA.md's "Decisions taken" #2 and METADATA_DETAILS.md §9.3 —
+// AND/OR composition is deferred work, not an oversight here). `eq`/`lo`/`hi` reuse
+// AttrValue rather than a fresh typed union, the same self-describing shape a
+// Record's own attrs already use.
+struct Predicate {
+    enum class Kind : uint8_t { Eq, Range };
+
+    size_t    attr;
+    Kind      kind;
+    AttrValue eq;  // Kind::Eq only: the value to match (Tag text, or Bool)
+    AttrValue lo, hi;  // Kind::Range only: inclusive bounds (Int64 or Float64)
+};
+
+inline Predicate pred_eq(size_t attr, AttrValue v) {
+    return Predicate{attr, Predicate::Kind::Eq, std::move(v), attr_null(), attr_null()};
+}
+inline Predicate pred_range(size_t attr, AttrValue lo, AttrValue hi) {
+    return Predicate{attr, Predicate::Kind::Range, attr_null(), std::move(lo), std::move(hi)};
+}
+
+// What MetadataStore::resolve() turns a Predicate into — the "hot-loop seam"
+// artifact (docs/design/METADATA_DETAILS.md §4): computed *once* per query, so
+// whatever later consumes this (a post-filter, a pre-filter's brute-force
+// allowlist, an in-traversal admit check — PRs 11-13, not built yet) does a plain
+// walk or bit test per candidate, never a per-candidate dispatch on predicate kind.
+//
+//   allowlist populated  — every *live* InternalId matching the predicate, exact.
+//                           Order is unspecified (cheapest to produce; nothing
+//                           downstream needs a particular order — a bitset build,
+//                           a brute-force scan, and a set intersection are all
+//                           order-agnostic). Resolvable in two cases: Tag/Bool
+//                           equality (via postings(), filtered against the caller's
+//                           liveness bitmap — postings alone isn't live-only, see
+//                           its own doc comment) and a numeric range on an
+//                           `indexed` column (via the B+-tree's range(), which is
+//                           already live-only by construction — no filtering
+//                           needed there).
+//   allowlist == nullopt — a numeric range on a column that isn't `indexed`:
+//                           materializing an exact match set would cost an O(N)
+//                           scan, so this isn't done eagerly. `predicate` is still
+//                           here for a future per-candidate check. No selectivity
+//                           estimate is available for this case either — that
+//                           needs a real estimator (histogram, sampling, or an
+//                           O(N) prepass), called out as separate, unbuilt work in
+//                           METADATA_DETAILS.md §4/§9, not invented here.
+struct ResolvedPredicate {
+    Predicate                              predicate;
+    std::optional<std::vector<InternalId>> allowlist;
+
+    // Exact selectivity — free once `allowlist` exists, since resolve() already
+    // paid for it. nullopt exactly when `allowlist` is (see above).
+    std::optional<size_t> selectivity() const {
+        if (!allowlist) return std::nullopt;
+        return allowlist->size();
+    }
 };
 
 class MetadataStore {
@@ -206,6 +266,15 @@ public:
     void range(size_t attr, double lo, double hi, Emit&& emit) const {
         range_(attr, sortable_bits(lo), sortable_bits(hi), std::forward<Emit>(emit));
     }
+
+    // Turns a Predicate into a ResolvedPredicate — see that struct's own doc
+    // comment for the two shapes this produces and why. `deleted` is the caller's
+    // liveness bitmap (VDB's own, same parameter rebuild_derived_state() already
+    // takes and for the identical reason: MetadataStore itself has no notion of
+    // "live," only VDB does). Throws std::invalid_argument if the predicate's kind
+    // or value/bound types don't match column `attr`'s declared type — the same
+    // eager, described-mismatch philosophy validate() already uses for a Record.
+    ResolvedPredicate resolve(const Predicate& pred, const std::vector<bool>& deleted) const;
 
     void serialize(std::vector<uint8_t>& out) const;
     void deserialize(Reader& r);
