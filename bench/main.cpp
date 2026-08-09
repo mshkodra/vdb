@@ -1,6 +1,7 @@
 #include "bench.h"
 #include "compare.h"
 #include "concurrency.h"
+#include "filter.h"
 #include "sift.h"
 
 #include "brute_index.h"
@@ -334,6 +335,10 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "sift-mt") {
         run_sift_mt(argc > 2 ? argv[2] : "data/sift",
                     argc > 3 ? std::atoi(argv[3]) : 8);
+        return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "filter") {
+        run_filter_bench(argc > 2 ? argv[2] : "data/sift");
         return 0;
     }
     std::printf("vdb Stage 1 benchmarks — compare MIN columns across versions\n");
