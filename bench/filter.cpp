@@ -21,6 +21,7 @@
 #include <random>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace vdb;
@@ -42,12 +43,26 @@ namespace {
 //   * K-means label generation (kmeans_labels) costs N*NC*iters distance
 //     computations = 1e6 * 100 * 15 = 1.5e9 — ~10x cheaper than IVF's own
 //     N*nlist*iters build in sift.cpp (nlist=1024), but still not free.
-//   * The selectivity sweep is expensive at BOTH ends, for different reasons:
-//     pre-filter's cost is O(N*s*dim), so it's slowest at the high-s end;
-//     post-filter's over-fetch `want = K+N(1-s)` approaches N as s -> 0, so
-//     HNSW's search degenerates toward a near-full graph traversal — plausibly
-//     slower per query than brute force. Q_TIMING/TIMING_REPS are kept small
-//     (unlike sift.cpp's 1000/5) specifically to bound this.
+//
+//  Sweep shape — asymmetric on purpose (see docs/results/filter_findings.md,
+//  local-only, for why): a prior run swept both strategies fully across
+//  LOW_S={0.5..0.001} and burned ~3 hours mostly re-confirming that post-filter is
+//  catastrophic there, one `s` at a time. That was foreseeable *before running
+//  anything* — `want=K+N(1-s)` is already >=500k of N=1M across the entire LOW_S
+//  range, so HNSW never gets to act like an ANN index, and the planner (which picks
+//  the strategy with the lower *predicted* cost) will never route a query to
+//  post-filter there regardless. Measuring it nine different ways added no
+//  information the cost model didn't already have.
+//    - Pre-filter gets the full LOW_S sweep: that IS its real usage domain (small
+//      matching sets), and each point costs seconds, not minutes.
+//    - Post-filter gets only POST_CONFIRM_LOW_S (two points, for calibration
+//      sanity — confirms the flat/catastrophic shape without re-mapping it) plus
+//      the full HIGH_S sweep, which is the region no prior run has ever measured:
+//      `want` only shrinks toward K as s -> 1, so HIGH_S is post-filter's actual
+//      claimed regime (FILTER_STRATEGY.md: "wins when the predicate barely excludes
+//      anything"). HIGH_S also gets pre-filter fully measured (its own cost,
+//      O(N*s*dim), is *worst* right where post-filter should be winning — this is
+//      where the real crossover, if any, has to live).
 // ============================================================================
 constexpr size_t DIM = 128;  // SIFT descriptors are 128-d
 
@@ -55,10 +70,17 @@ constexpr size_t NC           = 100;  // k-means clusters for correlated labels
 constexpr size_t KMEANS_ITERS = 15;
 constexpr unsigned LABEL_SEED = 7;
 
+// Pre-filter's full sweep (also where post-filter's two confirming points live).
 // Log-spaced, bracketing the ~3% percolation threshold from
 // docs/design/METADATA_DETAILS.md §1.3.
-const std::vector<double> SELECTIVITY = {0.5,  0.25,   0.1,    0.05,  0.025,
-                                         0.01, 0.005, 0.0025, 0.001};
+const std::vector<double> LOW_S = {0.5, 0.25, 0.1, 0.05, 0.025, 0.01, 0.005, 0.0025, 0.001};
+
+// Post-filter's actual claimed regime — unmeasured until now. want=K+N(1-s) at
+// s=0.999, N=1e6: want=1,010 (competitive); at s=0.9: want=100,010 (still large).
+const std::vector<double> HIGH_S = {0.75, 0.9, 0.95, 0.975, 0.99, 0.995, 0.999};
+
+// Calibration-sanity points for post-filter within LOW_S — not a re-sweep.
+const std::vector<double> POST_CONFIRM_LOW_S = {0.5, 0.1};
 
 constexpr size_t K           = 10;
 constexpr size_t Q_TIMING    = 100;
@@ -357,31 +379,66 @@ void run_filter_bench(const char* data_dir) {
             std::printf("  cached -> %s\n", cache.c_str());
         }
 
-        for (double s : SELECTIVITY) {
+        // Pre-filter: time it, push a "pre" row + calibration point. Independent of
+        // whether post-filter also gets measured at this s.
+        auto measure_pre = [&](double s) {
             const Predicate pred = pred_range(0, attr_float(0.0), attr_float(s));
+            auto pre_fn = [&](const float* q) { return db->search_prefiltered(q, K, pred); };
+            const auto pre_ts = time_queries(pre_fn, queries.data(), q_timing, TIMING_REPS);
 
+            const double N    = static_cast<double>(n_base);
+            const double scan = N * s * static_cast<double>(DIM);
+            rows.push_back({label, "pre", s, build_ms, 1.0, pre_ts.qps, pre_ts.mean_us,
+                            pre_ts.p50_us, pre_ts.p95_us, pre_ts.p99_us, 0.0, scan});
+            pre_points.push_back({scan, pre_ts.mean_us});
+            return pre_ts;
+        };
+
+        // Post-filter: time it, compute recall against pre-filter's own output (the
+        // exact oracle — tests/test_filter.cpp proves pre-filter is exact regardless
+        // of IndexKind), push a "post" row + calibration point.
+        auto measure_post = [&](double s) {
+            const Predicate pred = pred_range(0, attr_float(0.0), attr_float(s));
             auto post_fn = [&](const float* q) { return db->search(q, K, pred); };
-            auto pre_fn  = [&](const float* q) { return db->search_prefiltered(q, K, pred); };
-
             const auto post_ts = time_queries(post_fn, queries.data(), q_timing, TIMING_REPS);
-            const auto pre_ts  = time_queries(pre_fn, queries.data(), q_timing, TIMING_REPS);
             const double recall = post_recall_vs_prefilter(*db, pred, queries.data(), q_timing);
 
             const double N    = static_cast<double>(n_base);
             const double want = static_cast<double>(K) + N * (1.0 - s);
-            const double scan = N * s * static_cast<double>(DIM);
-
             rows.push_back({label, "post", s, build_ms, recall, post_ts.qps, post_ts.mean_us,
                             post_ts.p50_us, post_ts.p95_us, post_ts.p99_us, want, 0.0});
-            rows.push_back({label, "pre", s, build_ms, 1.0, pre_ts.qps, pre_ts.mean_us,
-                            pre_ts.p50_us, pre_ts.p95_us, pre_ts.p99_us, 0.0, scan});
-
             post_points.push_back({want, post_ts.mean_us});
-            pre_points.push_back({scan, pre_ts.mean_us});
+            return std::make_pair(post_ts, recall);
+        };
 
-            std::printf("  s=%-8.4f post: %8.1f QPS (p95 %6.0f us, recall %.3f) | "
-                        "pre: %8.1f QPS (p95 %6.0f us)\n",
-                        s, post_ts.qps, post_ts.p95_us, recall, pre_ts.qps, pre_ts.p95_us);
+        // LOW_S: pre-filter's real usage domain, full sweep. Post-filter only at the
+        // two confirming points — see the EXPERIMENT GRID comment for why the rest
+        // isn't worth re-measuring.
+        for (double s : LOW_S) {
+            const auto pre_ts = measure_pre(s);
+            const bool confirm = std::find(POST_CONFIRM_LOW_S.begin(), POST_CONFIRM_LOW_S.end(), s) !=
+                                 POST_CONFIRM_LOW_S.end();
+            if (confirm) {
+                const auto [post_ts, recall] = measure_post(s);
+                std::printf("  s=%-8.4f [low]     pre: %8.1f QPS (p95 %7.0f us) | "
+                            "post: %8.1f QPS (p95 %7.0f us, recall %.3f, confirm)\n",
+                            s, pre_ts.qps, pre_ts.p95_us, post_ts.qps, post_ts.p95_us, recall);
+            } else {
+                const double want = static_cast<double>(K) + static_cast<double>(n_base) * (1.0 - s);
+                std::printf("  s=%-8.4f [low]     pre: %8.1f QPS (p95 %7.0f us) | "
+                            "post: skipped (want=%.0f, already known catastrophic)\n",
+                            s, pre_ts.qps, pre_ts.p95_us, want);
+            }
+        }
+
+        // HIGH_S: post-filter's actual claimed regime, unmeasured until now. Both
+        // strategies measured fully — this is where a real crossover, if any, lives.
+        for (double s : HIGH_S) {
+            const auto pre_ts            = measure_pre(s);
+            const auto [post_ts, recall] = measure_post(s);
+            std::printf("  s=%-8.4f [high]    pre: %8.1f QPS (p95 %7.0f us) | "
+                        "post: %8.1f QPS (p95 %7.0f us, recall %.3f)\n",
+                        s, pre_ts.qps, pre_ts.p95_us, post_ts.qps, post_ts.p95_us, recall);
         }
     };
 
@@ -399,7 +456,10 @@ void run_filter_bench(const char* data_dir) {
                 "c_scan=%.6f us/unit(N*s*dim)\n", calib.c_index, calib.c_scan);
     std::printf("[planner] predicted choice per selectivity (K=%zu, N=%zu, dim=%zu):\n",
                 K, n_base, DIM);
-    for (double s : SELECTIVITY) {
+    std::vector<double> all_s = LOW_S;
+    all_s.insert(all_s.end(), HIGH_S.begin(), HIGH_S.end());
+    std::sort(all_s.begin(), all_s.end());
+    for (double s : all_s) {
         const FilterStrategy pick = plan_strategy(calib, n_base, DIM, K, s);
         std::printf("    s=%-8.4f -> %s\n", s, pick == FilterStrategy::Post ? "post" : "pre");
     }
