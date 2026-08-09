@@ -16,6 +16,7 @@
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <string>
@@ -64,10 +65,10 @@ constexpr size_t Q_TIMING    = 100;
 constexpr int    TIMING_REPS = 2;
 
 // Subsample cap on the 1M-vector base set. Two full HNSW builds over 1M vectors is
-// the intended "SIFT1M" scope, but under host contention that's not reliably
-// tractable in one sitting; capping keeps a run honest-but-tractable. Set to a value
-// >= n_base (or std::numeric_limits<size_t>::max()) for the uncapped full run.
-constexpr size_t N_CAP = 100000;
+// the intended "SIFT1M" scope; drop this below n_base only if wall-clock is a
+// problem (e.g. running with the lid closed lets macOS suspend the process, which
+// looks like host contention but isn't — keep the machine awake instead of capping).
+constexpr size_t N_CAP = std::numeric_limits<size_t>::max();
 // ============================================================================
 
 // ---- .fvecs reader (mirrors bench/sift.cpp's — each driver keeps its own copy,
@@ -321,20 +322,24 @@ void run_filter_bench(const char* data_dir) {
         cfg.dim    = DIM;
         cfg.metric = Metric::L2;
         cfg.schema = rank_schema();
-        VDB db(cfg);
+        auto db = std::make_unique<VDB>(cfg);
 
         double build_ms = 0.0;
         bool loaded = false;
         try {
-            load_snapshot(db, cache);
-            loaded = true;
+            load_snapshot(*db, cache);
+            // load_snapshot only validates dim/metric/schema fingerprint, not vector
+            // count — a cache built at a different N_CAP would otherwise load
+            // silently instead of rebuilding at the size this run actually wants.
+            loaded = (db->size() == n_base);
         } catch (const std::exception&) {
             // No cache yet, or it doesn't match this VDB's config — build fresh.
         }
+        if (!loaded) db = std::make_unique<VDB>(cfg);  // discard a wrong-sized partial load
 
         if (loaded) {
             std::printf("\n[%s]  loaded cache %s (N=%zu)\n", label.c_str(), cache.c_str(),
-                        db.size());
+                        db->size());
         } else {
             std::printf("\n[%s]  building HNSW over %zu vectors — this is the slow "
                         "one...\n", label.c_str(), n_base);
@@ -342,25 +347,25 @@ void run_filter_bench(const char* data_dir) {
                 for (size_t i = 0; i < n_base; ++i) {
                     Record r;
                     r.attrs = {attr_float(ranks[i])};
-                    db.insert(base.data() + i * DIM, r);
+                    db->insert(base.data() + i * DIM, r);
                     if ((i + 1) % 200000 == 0)
                         std::printf("    ... %zu / %zu inserted\n", i + 1, n_base);
                 }
             });
             std::printf("  build %.0f ms\n", build_ms);
-            save_snapshot(db, cache, 0);
+            save_snapshot(*db, cache, 0);
             std::printf("  cached -> %s\n", cache.c_str());
         }
 
         for (double s : SELECTIVITY) {
             const Predicate pred = pred_range(0, attr_float(0.0), attr_float(s));
 
-            auto post_fn = [&](const float* q) { return db.search(q, K, pred); };
-            auto pre_fn  = [&](const float* q) { return db.search_prefiltered(q, K, pred); };
+            auto post_fn = [&](const float* q) { return db->search(q, K, pred); };
+            auto pre_fn  = [&](const float* q) { return db->search_prefiltered(q, K, pred); };
 
             const auto post_ts = time_queries(post_fn, queries.data(), q_timing, TIMING_REPS);
             const auto pre_ts  = time_queries(pre_fn, queries.data(), q_timing, TIMING_REPS);
-            const double recall = post_recall_vs_prefilter(db, pred, queries.data(), q_timing);
+            const double recall = post_recall_vs_prefilter(*db, pred, queries.data(), q_timing);
 
             const double N    = static_cast<double>(n_base);
             const double want = static_cast<double>(K) + N * (1.0 - s);
