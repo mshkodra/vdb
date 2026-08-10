@@ -2,6 +2,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -33,10 +34,36 @@ struct HNSWConfig {
 //   - `entry_mutex_` guards the entry point and max layer.
 // At most one node lock is ever held at a time, so the graph edit is deadlock-free
 // without a lock-ordering rule.
-template <class Dist>
+//
+// `Elem` (default float): what a node's stored vector is made of. This exists for
+// scalar quantization — HNSWIndex<L2Int8, int8_t> stores int8_t in memory instead
+// of float, cutting a node's vector footprint 4x, while every insert/search
+// entry point still takes/returns `float*`/`float` per the Index interface (the
+// float<->Elem conversion happens once per call, at quantize_()). For Elem=float
+// this is all a no-op identity path — zero behavior change from before this
+// parameter existed, which is why every existing call site (HNSWIndex<L2>, relying
+// on the default) compiles and runs unchanged.
+//
+// Quantization is symmetric and dataset-wide, not per-vector: train() computes one
+// scale = max(|value|) / 127 across a calibration batch, so every stored vector and
+// every query share the same affine mapping. That's what makes int8-space squared
+// L2 an exact rescaling of true squared L2 (see distance.h's L2Int8 comment) —
+// per-vector scales would break that property. Consequence a caller must accept:
+// train() must run before any insert when Elem != float (add()/allocate() throw
+// otherwise), and an insert whose values fall outside the calibrated range gets
+// clipped, not re-calibrated — recalibrating would require requantizing every
+// already-stored vector.
+template <class Dist, class Elem = float>
 class HNSWIndex : public Index {
 public:
     explicit HNSWIndex(HNSWConfig cfg);
+
+    // Elem != float only: computes the single dataset-wide quantization scale from
+    // `data` (n vectors of dim config_.dim, row-major) — must be called before the
+    // first add()/allocate(). A no-op for Elem=float (matches the Index base
+    // class's default train(), just made explicit here rather than inherited, so
+    // the "must train first" contract for Elem=int8_t is enforced in one place).
+    void train(const float* data, size_t n) override;
 
     InternalId add(const float* vec) override;
     InternalId allocate(const float* vec) override;  // serial: reserve slot + store vector
@@ -53,7 +80,7 @@ public:
 
 private:
     struct Node {
-        std::vector<float>                   data;        // immutable after allocate
+        std::vector<Elem>                    data;        // immutable after allocate
         std::vector<std::vector<InternalId>> neighbours;  // outer sized once; inner mutable
         std::unique_ptr<std::mutex>          lock;        // guards `neighbours`
     };
@@ -65,12 +92,29 @@ private:
     size_t      ef_search_   = 50;
     mutable std::mt19937 rng_;  // touched only under grow_mutex_
 
+    // Elem != float only (see the class comment for why quantization is dataset-
+    // wide, not per-vector): scale_ maps a raw float value to its int8 code via
+    // round(v / scale_), clamped to [-127, 127]. trained_ gates add()/allocate()
+    // until train() has actually run. Both are always present (even for Elem=float,
+    // where they're inert — scale_ stays 1.0, trained_ is never checked) so the
+    // rest of the class needs no separate Elem=float/!=float code path outside
+    // train()/quantize_()/serialize()/deserialize() themselves.
+    float scale_   = 1.0f;
+    bool  trained_ = false;
+
     std::vector<Node> nodes_;  // reserved to max_elements; never reallocates
 
     mutable std::mutex  grow_mutex_;   // serialises append into nodes_ + rng_; read by size()
     mutable std::mutex  entry_mutex_;  // guards entry_point_ + max_layer_
 
     int sample_layer_() const;  // caller must hold grow_mutex_
+
+    // float -> Elem for one vector. Identity copy when Elem=float; symmetric
+    // quantization (round(v/scale_), clamped) otherwise. The one place a float
+    // vector crosses into the index's stored representation — every internal
+    // method after this point (search_layer, select_neighbors, closest_,
+    // link_node_) operates purely on Elem, never float.
+    std::vector<Elem> quantize_(const float* v) const;
 
     // Serial half of add(): reserve the slot, store the vector, size the neighbour
     // arrays, sample the layer. Returns (internal id, top layer).
@@ -80,15 +124,15 @@ private:
     // per-node locks. Reads its own vector from nodes_[id].data.
     void link_node_(InternalId id);
 
-    std::vector<InternalId> search_layer(const float* q, InternalId ep, size_t ef,
+    std::vector<InternalId> search_layer(const Elem* q, InternalId ep, size_t ef,
                                          int layer_number) const;
 
-    std::vector<InternalId> select_neighbors(const float* q,
+    std::vector<InternalId> select_neighbors(const Elem* q,
                                              std::vector<InternalId> cands,
                                              size_t M) const;
 
     // Nearest of `cands` to q (cands must be non-empty).
-    InternalId closest_(const float* q, const std::vector<InternalId>& cands) const;
+    InternalId closest_(const Elem* q, const std::vector<InternalId>& cands) const;
 };
 
 }

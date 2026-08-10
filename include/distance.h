@@ -32,6 +32,32 @@ struct InnerProduct {
     }
 };
 
+// Quantized L2, for HNSWIndex<L2, int8_t> (see hnsw_index.h's `Elem` template
+// parameter). Operates on int8_t-quantized vectors that share one caller-supplied
+// scale (symmetric quantization: q_i = round(v_i / scale), no zero-point) — so the
+// difference (a_i - b_i) in quantized space is exactly (true_a_i - true_b_i)/scale,
+// and this returns the *unscaled* sum of squared differences: exactly
+// true_squared_l2_distance / scale^2. That's a positive multiple of the real
+// distance for every pair, so it preserves nearest-neighbour ranking on its own —
+// the caller (HNSWIndex) only needs to multiply by scale^2 at the very end, to
+// report a distance comparable in magnitude to plain float L2, not on every
+// comparison in the hot loop.
+//
+// Accumulates in int32_t: each per-dimension term is at most (255)^2 = 65025
+// (the largest possible int8 difference, -127 to 127), and SIFT's dim=128 means
+// a worst-case sum of ~8.3M — nowhere near int32_t's ~2.1B ceiling, no overflow
+// risk for any dimension count this project uses.
+struct L2Int8 {
+    int32_t operator()(const int8_t* a, const int8_t* b, size_t dim) const {
+        int32_t total = 0;
+        for (size_t i = 0; i < dim; ++i) {
+            const int32_t diff = static_cast<int32_t>(a[i]) - static_cast<int32_t>(b[i]);
+            total += diff * diff;
+        }
+        return total;
+    }
+};
+
 struct Cosine {
     float operator()(const float* a, const float* b, size_t dim) const {
         auto norm = [](const float* v, size_t n) {
