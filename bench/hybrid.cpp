@@ -11,8 +11,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -243,4 +245,116 @@ void run_hybrid_bench(const char* data_dir) {
               db->search_hybrid(queries.data(), 0, "legendary", 5));
     print_hits(*db, "search_hybrid (category=item): query vector 0 + \"legendary\"",
               db->search_hybrid(queries.data(), 0, "legendary", 5, pred_eq(1, attr_tag("item"))));
+}
+
+void run_hybrid_repl(const char* data_dir) {
+    const std::string dir   = data_dir;
+    const std::string cache = dir + "/cache/hybrid_minecraft.snap";
+
+    VDBConfig cfg;
+    cfg.kind   = IndexKind::HNSW;
+    cfg.dim    = DIM;
+    cfg.metric = Metric::L2;
+    cfg.schema = minecraft_schema();
+    VDB db(cfg);
+
+    std::printf("loading cached corpus %s ...\n", cache.c_str());
+    try {
+        load_snapshot(db, cache);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "!! no cached corpus at %s (%s)\n!! run `./build/run_bench hybrid %s` "
+                     "first to build it\n",
+                     cache.c_str(), e.what(), data_dir);
+        std::exit(1);
+    }
+    std::printf("loaded N=%zu\n", db.size());
+
+    size_t n_query = 0;
+    const auto queries = read_fvecs(dir + "/sift_query.fvecs", n_query);
+
+    std::printf(
+        "\nHybrid search REPL over the synthetic Minecraft corpus.\n"
+        "  <words>                              BM25 text search over 'description'\n"
+        "  --cat <item|block|mob|biome> <words>  text search filtered to category\n"
+        "  --vec <query index, 0-%zu> <words>    hybrid search (vector + text)\n"
+        "  --vec <n> --cat <cat> <words>         hybrid search, filtered\n"
+        "  --k <n> <words>                       result count (default 5)\n"
+        "  help | quit / exit / Ctrl-D\n",
+        n_query - 1);
+
+    std::string line;
+    for (;;) {
+        std::printf("\n> ");
+        std::fflush(stdout);
+        if (!std::getline(std::cin, line)) break;  // EOF (Ctrl-D)
+
+        const size_t b = line.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;  // blank line
+        const size_t e = line.find_last_not_of(" \t");
+        line           = line.substr(b, e - b + 1);
+
+        if (line == "quit" || line == "exit") break;
+        if (line == "help") {
+            std::printf(
+                "  <words>                              BM25 text search over 'description'\n"
+                "  --cat <item|block|mob|biome> <words>  text search filtered to category\n"
+                "  --vec <query index, 0-%zu> <words>    hybrid search (vector + text)\n"
+                "  --vec <n> --cat <cat> <words>         hybrid search, filtered\n"
+                "  --k <n> <words>                       result count (default 5)\n"
+                "  quit / exit / Ctrl-D\n",
+                n_query - 1);
+            continue;
+        }
+
+        std::istringstream       iss(line);
+        std::string              tok;
+        long                     vec_idx = -1;
+        std::string              category;
+        size_t                   K = 5;
+        std::vector<std::string> rest;
+        while (iss >> tok) {
+            if (tok == "--vec") {
+                if (!(iss >> vec_idx)) { std::printf("!! --vec needs a number\n"); iss.clear(); }
+            } else if (tok == "--cat") {
+                if (!(iss >> category)) { std::printf("!! --cat needs a value\n"); iss.clear(); }
+            } else if (tok == "--k") {
+                long k = 0;
+                if (iss >> k && k > 0) K = static_cast<size_t>(k);
+                else { std::printf("!! --k needs a positive number\n"); iss.clear(); }
+            } else {
+                rest.push_back(tok);
+            }
+        }
+        if (rest.empty()) { std::printf("(empty query — type 'help')\n"); continue; }
+        if (vec_idx >= 0 && static_cast<size_t>(vec_idx) >= n_query) {
+            std::printf("!! --vec %ld out of range (0-%zu)\n", vec_idx, n_query - 1);
+            continue;
+        }
+
+        std::string query_text;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (i) query_text += ' ';
+            query_text += rest[i];
+        }
+
+        try {
+            std::vector<Hit> hits;
+            if (vec_idx >= 0 && !category.empty()) {
+                hits = db.search_hybrid(queries.data() + static_cast<size_t>(vec_idx) * DIM, 0,
+                                        query_text, K, pred_eq(1, attr_tag(category)));
+            } else if (vec_idx >= 0) {
+                hits = db.search_hybrid(queries.data() + static_cast<size_t>(vec_idx) * DIM, 0,
+                                        query_text, K);
+            } else if (!category.empty()) {
+                hits = db.search_text(0, query_text, K, pred_eq(1, attr_tag(category)));
+            } else {
+                hits = db.search_text(0, query_text, K);
+            }
+            print_hits(db, query_text.c_str(), hits);
+        } catch (const std::exception& ex) {
+            std::printf("!! %s\n", ex.what());
+        }
+    }
+    std::printf("\nbye\n");
 }
