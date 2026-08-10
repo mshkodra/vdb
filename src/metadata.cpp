@@ -500,8 +500,9 @@ ResolvedPredicate MetadataStore::resolve(const Predicate& pred, const std::vecto
 }
 
 std::vector<TextMatch> MetadataStore::search_text(size_t attr, const std::string& query, size_t K,
-                                                   const std::vector<bool>& deleted, float k1,
-                                                   float b) const {
+                                                   const std::vector<bool>& deleted,
+                                                   const std::vector<InternalId>* allowlist,
+                                                   float k1, float b) const {
     const Column& c = columns_[attr];
     if (c.type != AttrType::Text)
         throw std::invalid_argument("search_text on attribute '" + schema_[attr].name +
@@ -539,11 +540,18 @@ std::vector<TextMatch> MetadataStore::search_text(size_t attr, const std::string
     }
 
     // Union of postings, live-filtered and de-duplicated — see this method's doc
-    // comment for the OR-semantics rationale.
+    // comment for the OR-semantics rationale. `allow` is built once (not re-checked
+    // per posting via a linear scan) — see `allowlist`'s doc comment for what gates
+    // it.
+    std::unordered_set<InternalId> allow;
+    if (allowlist) allow.insert(allowlist->begin(), allowlist->end());
+
     std::unordered_set<InternalId> candidates;
     for (uint32_t code : term_codes)
         for (InternalId id : postings(attr, code))
-            if (id < deleted.size() && !deleted[id] && c.present[id]) candidates.insert(id);
+            if (id < deleted.size() && !deleted[id] && c.present[id] &&
+                (!allowlist || allow.count(id)))
+                candidates.insert(id);
 
     std::vector<TextMatch> out;
     out.reserve(candidates.size());

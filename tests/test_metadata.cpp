@@ -5,6 +5,7 @@
 #include "snapshot.h"
 #include "vdb.h"
 
+#include <cmath>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -1559,4 +1560,58 @@ TEST(vdb_search_text_excludes_removed_documents) {
     ASSERT(db.remove(a));
 
     EXPECT(db.search_text(0, "fox", 5).empty());
+}
+
+TEST(search_text_with_predicate_restricts_to_matching_rows) {
+    VDB db(text_config());
+    const float v[2] = {0.0f, 0.0f};
+    const ExternalId a = db.insert(v, text_row("fox jumps", "shoes"));
+    db.insert(v, text_row("fox runs", "hats"));  // matches "fox" too, wrong category
+
+    const auto hits = db.search_text(0, "fox", 5, pred_eq(1, attr_tag("shoes")));
+    ASSERT(hits.size() == 1);
+    EXPECT(hits[0].id == a);
+}
+
+// ---- Phase B, B5: RRF fusion (VDB::search_hybrid). Wire surface (B6) is not
+//      built yet. ----
+
+TEST(search_hybrid_lets_a_lexical_only_winner_outrank_a_vector_only_winner) {
+    VDB db(text_config());
+    const float qv[2] = {0.0f, 0.0f};
+    // A: vector-search's best possible result (distance 0) but no lexical match at
+    // all (its text shares no term with the query) -> absent from the lexical list
+    // entirely, not just ranked low in it.
+    const ExternalId a = db.insert(qv, text_row("nothing related", "misc"));
+    // B: vector-search's *worst* result (far away) but the lexical ranker's only
+    // match, rank 1 there.
+    const float far[2] = {100.0f, 100.0f};
+    const ExternalId b = db.insert(far, text_row("fox jumps", "misc"));
+
+    const auto hits = db.search_hybrid(qv, 0, "fox jumps", 2);
+    ASSERT(hits.size() == 2);
+    // B's combined rank contribution (vector rank 2 + lexical rank 1) beats A's
+    // vector-only contribution (vector rank 1, nothing from the lexical side) — RRF
+    // fuses by rank position summed across rankers, not by whichever ranker "wins
+    // outright," which is the entire point of doing this instead of just running
+    // one ranker.
+    EXPECT(hits[0].id == b);
+    EXPECT(hits[1].id == a);
+
+    const double want_b = 1.0 / (60.0 + 2.0) + 1.0 / (60.0 + 1.0);
+    const double want_a = 1.0 / (60.0 + 1.0);
+    EXPECT(std::fabs(hits[0].dist - want_b) < 1e-6);
+    EXPECT(std::fabs(hits[1].dist - want_a) < 1e-6);
+}
+
+TEST(search_hybrid_with_predicate_gates_both_rankers) {
+    VDB db(text_config());
+    const float qv[2] = {0.0f, 0.0f};
+    const ExternalId shoes_match = db.insert(qv, text_row("fox jumps", "shoes"));
+    const float far[2] = {50.0f, 50.0f};
+    db.insert(far, text_row("fox jumps", "hats"));  // same text, wrong category
+
+    const auto hits = db.search_hybrid(qv, 0, "fox jumps", 5, pred_eq(1, attr_tag("shoes")));
+    ASSERT(hits.size() == 1);
+    EXPECT(hits[0].id == shoes_match);
 }
