@@ -7,3 +7,9 @@
 // the same way filter.cpp attaches a synthetic `rank` label to the same vectors.
 // Invoked as `run_bench hybrid [data_dir]`.
 void run_hybrid_bench(const char* data_dir);
+
+// Interactive REPL over the corpus run_hybrid_bench() builds and caches — loads the
+// cached snapshot (fails with a pointer to `run_bench hybrid` if it doesn't exist
+// yet; never builds one itself) and lets you type queries at a terminal prompt.
+// Invoked as `run_bench hybrid-repl [data_dir]`.
+void run_hybrid_repl(const char* data_dir);

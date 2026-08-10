@@ -346,6 +346,10 @@ int main(int argc, char** argv) {
         run_hybrid_bench(argc > 2 ? argv[2] : "data/sift");
         return 0;
     }
+    if (argc > 1 && std::string(argv[1]) == "hybrid-repl") {
+        run_hybrid_repl(argc > 2 ? argv[2] : "data/sift");
+        return 0;
+    }
     std::printf("vdb Stage 1 benchmarks — compare MIN columns across versions\n");
     bench_distance();
     bench_brute();
