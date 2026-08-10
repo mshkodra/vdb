@@ -41,6 +41,7 @@ enum class AttrType : uint8_t {
     Float64 = 2,
     Bool    = 3,
     Tag     = 4,  // dictionary-encoded string: stored as a uint32 code
+    Text    = 5,  // tokenized into many terms, inverted-indexed (Phase B, hybrid search)
 };
 
 // One declared attribute. The schema is fixed at VDB construction and persisted
@@ -90,6 +91,18 @@ inline AttrValue attr_bool(bool v) {
 inline AttrValue attr_tag(std::string v) {
     return AttrValue{AttrType::Tag, 0, std::move(v)};
 }
+inline AttrValue attr_text(std::string v) {
+    return AttrValue{AttrType::Text, 0, std::move(v)};
+}
+
+// Lowercase, split on runs of non-alphanumeric bytes, drop empty tokens. No
+// stopword removal, no stemming — the simplest tokenizer that produces a
+// deterministic term set, and deliberately easy to swap out later (nothing
+// downstream depends on *how* a string becomes terms, only that the same string
+// always produces the same terms). Shared by MetadataStore::intern_terms_ (index
+// time) and, later, Phase B's query-time scorer — a query's term set must be
+// produced the same way a document's was, or matches silently miss.
+std::vector<std::string> tokenize_text(const std::string& s);
 
 // The metadata attached to one vector. `attrs` is positional against the declared
 // schema; an empty vector means "all null", which is what a metadata-less insert
@@ -224,6 +237,10 @@ public:
     // Exact count of live rows where column `attr` holds `code` (a dictionary code
     // for Tag, 0/1 for Bool). O(1) — the payoff of maintaining it incrementally rather
     // than scanning. 0 for a code the column has never seen.
+    //
+    // Text reuses this exact field as its per-term document frequency (BM25's `df`):
+    // a Text row can hold many term codes rather than one, so count[code] here means
+    // "how many live rows contain this term," maintained the same incremental way.
     uint32_t count(size_t attr, uint32_t code) const {
         const auto& c = columns_[attr].count;
         return code < c.size() ? c[code] : 0;
@@ -236,10 +253,30 @@ public:
     // A consumer must additionally check present()/column_raw() (and, for liveness,
     // VDB's own deleted_) before trusting an entry; postings.size() only equals
     // count() exactly right after compact() rebuilds it (see permute()).
+    //
+    // Text reuses this exact field too: postings(attr, term_code) is every live-or-
+    // not row that ever contained that term, one entry per row (not per occurrence
+    // — a repeated term within one row is deduplicated before posting, see
+    // intern_terms_).
     const std::vector<InternalId>& postings(size_t attr, uint32_t code) const {
         static const std::vector<InternalId> empty;
         const auto& p = columns_[attr].postings;
         return code < p.size() ? p[code] : empty;
+    }
+
+    // Text only: resolves a token to column `attr`'s term id — the same dict/codes
+    // fields tag_code() already looks up (a "tag" and a "term" are different things
+    // at the call site; the underlying dictionary storage is identical either way).
+    // False if the token was never interned by any row written so far.
+    bool text_term_code(size_t attr, const std::string& term, uint32_t& out) const {
+        return tag_code(attr, term, out);
+    }
+
+    // Text only: row `id`'s total token count in column `attr` (occurrences
+    // included) — BM25's `doc_len`. 0 for an absent (null) value.
+    uint32_t text_doc_len(size_t attr, InternalId id) const {
+        const Column& c = columns_[attr];
+        return c.present[id] ? c.doc_len[id] : 0;
     }
 
     // Every *live* InternalId whose column `attr` holds a value in [lo, hi]
@@ -295,10 +332,37 @@ private:
         // Empty, untouched, for Int64/Float64 columns.
         std::vector<uint32_t> count;
 
-        // Tag/Bool only: postings[code] = every InternalId ever written with this
-        // value, in no particular order. Same shape as `count` (dict-sized for Tag,
-        // size 2 for Bool) but append-only — see the public postings() accessor.
+        // Tag/Bool/Text only: postings[code] = every InternalId ever written with
+        // this value (Tag/Bool) or containing this term (Text), in no particular
+        // order. Same shape as `count` (dict-sized for Tag/Text, size 2 for Bool)
+        // but append-only — see the public postings() accessor.
         std::vector<std::vector<InternalId>> postings;
+
+        // Text only. A row's "value" is many terms, not one, so it can't live in
+        // `data`/`present` above the way every other type's does — this is Text's
+        // analogue of `data[id]`. text_terms[id] holds the row's de-duplicated term
+        // codes (indices into `dict`/`codes` above, interned via the same intern_()
+        // Tag values use) — deliberately de-duplicated, since this is what postings/
+        // doc_freq walk to decide "does this doc contain this term" (a doc counts
+        // once, not once per occurrence). Not serialized — deserialize() rebuilds it
+        // by re-tokenizing raw_text against the freshly-loaded dict, the same
+        // "derive, don't duplicate" choice count/postings/index already make.
+        std::vector<std::vector<uint32_t>> text_terms;
+
+        // Text only. Row `id`'s *total* token count, occurrences included — BM25's
+        // length norm (`doc_len` in B2's design) cares how long a document is, not
+        // how large its vocabulary is, so this is deliberately not text_terms[id]
+        // .size() (a repeated word inflates doc_len but not the term-code set above).
+        // Same derive-don't-duplicate treatment as text_terms: not serialized,
+        // recomputed by deserialize() alongside it.
+        std::vector<uint32_t> doc_len;
+
+        // Text only. The original string, by InternalId, exactly as written —
+        // tokenization is lossy (word order, casing, punctuation all gone), so this
+        // is what get()/get_row() return for a Text attribute, and what deserialize()
+        // re-tokenizes to rebuild text_terms/doc_len above. Same shape and same
+        // reason as payload_: raw bytes, serialized directly, never derived.
+        std::vector<std::string> raw_text;
 
         // indexed Int64/Float64 only, null otherwise: keyed on sortable_bits(value),
         // holding InternalId. unique_ptr, not BPlusTree by value, because BPlusTree
@@ -341,7 +405,18 @@ private:
     }
 
     uint32_t intern_(Column& c, const std::string& s);
-    void     compute_fingerprint_();
+
+    // Text only: tokenize_text(text), intern each unique token into `c`'s dictionary
+    // (via intern_() above — same dict Tag values are interned into), and return the
+    // row's de-duplicated term-code set (text_terms[id]'s value). `out_doc_len`
+    // receives the *un*-deduplicated token count (doc_len[id]'s value) — tokenize_text
+    // is only run once per call, so both come out of the same pass rather than
+    // tokenizing twice. Used at insert (append_row/set_row) and again at
+    // deserialize() to rebuild text_terms/doc_len from raw_text without persisting
+    // redundant arrays.
+    std::vector<uint32_t> intern_terms_(Column& c, const std::string& text, uint32_t& out_doc_len);
+
+    void compute_fingerprint_();
 
     std::vector<AttrSpec>             schema_;
     std::vector<Column>               columns_;  // parallel to schema_

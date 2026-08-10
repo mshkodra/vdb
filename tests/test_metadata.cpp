@@ -42,6 +42,29 @@ Record row(const std::string& cat, int64_t price, bool stock, double rating,
 
 std::vector<uint8_t> bytes(const std::string& s) { return {s.begin(), s.end()}; }
 
+// title (text, tokenized/inverted-indexed) | category (tag) — pairs a Text column
+// with a Tag column, same "one of each kind" shape demo_schema() uses.
+std::vector<AttrSpec> text_schema() {
+    return {{"title", AttrType::Text}, {"category", AttrType::Tag}};
+}
+
+VDBConfig text_config(IndexKind kind = IndexKind::Brute) {
+    VDBConfig cfg;
+    cfg.kind   = kind;
+    cfg.dim    = 2;
+    cfg.metric = Metric::L2;
+    cfg.schema = text_schema();
+    return cfg;
+}
+
+Record text_row(const std::string& title, const std::string& cat = "misc",
+                std::vector<uint8_t> payload = {}) {
+    Record r;
+    r.attrs   = {attr_text(title), attr_tag(cat)};
+    r.payload = std::move(payload);
+    return r;
+}
+
 std::string temp_dir(const char* name) {
     auto p = std::filesystem::temp_directory_path() /
              ("vdb_meta_" + std::string(name) + "_" + std::to_string(::getpid()));
@@ -1134,5 +1157,263 @@ TEST(durable_recovery_restores_attr_counts_across_checkpoint_and_wal_tail) {
     EXPECT(reopened.attr_count(2, 1) == 4);  // in_stock=true: pre x3 + changed x1
     EXPECT(reopened.attr_count(2, 0) == 2);  // in_stock=false: post x2
 
+    std::filesystem::remove_all(dir);
+}
+
+// ---- Phase B, B1/B2/B3: AttrType::Text — tokenization, inverted index, durability
+//      (docs/plans/HYBRID_SEARCH_PLAN.md). BM25 scoring (B4) and RRF fusion (B5) are
+//      not built yet; these tests cover the storage layer they'll sit on. ----
+
+TEST(tokenize_text_lowercases_and_splits_on_non_alnum) {
+    const std::vector<std::string> want = {"the", "quick", "brown", "fox", "jumps", "123"};
+    EXPECT(tokenize_text("The Quick-Brown Fox, jumps!! 123") == want);
+}
+
+TEST(tokenize_text_drops_empty_tokens_at_boundaries) {
+    const std::vector<std::string> want = {"hello", "world"};
+    EXPECT(tokenize_text("  --hello--world--  ") == want);
+}
+
+TEST(tokenize_text_of_empty_string_is_empty) {
+    EXPECT(tokenize_text("").empty());
+    EXPECT(tokenize_text("   ---   ").empty());
+}
+
+TEST(text_column_interns_terms_into_a_shared_dictionary) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("the quick brown fox"));
+    m.append_row(text_row("the lazy fox sleeps"));
+
+    uint32_t the = 999, fox = 999, quick = 999, lazy = 999, missing = 999;
+    ASSERT(m.text_term_code(0, "the", the));
+    ASSERT(m.text_term_code(0, "fox", fox));
+    ASSERT(m.text_term_code(0, "quick", quick));
+    ASSERT(m.text_term_code(0, "lazy", lazy));
+    EXPECT(!m.text_term_code(0, "elephant", missing));  // never written: no code
+
+    // Postings record every row ever written, independent of mark_live/mark_dead —
+    // same contract Tag's postings() already has (see its own doc comment).
+    const std::vector<InternalId> want_the = {0, 1};
+    EXPECT(m.postings(0, the) == want_the);
+    const std::vector<InternalId> want_quick = {0};
+    EXPECT(m.postings(0, quick) == want_quick);
+    const std::vector<InternalId> want_lazy = {1};
+    EXPECT(m.postings(0, lazy) == want_lazy);
+
+    EXPECT(m.text_doc_len(0, 0) == 4);  // "the quick brown fox"
+    EXPECT(m.text_doc_len(0, 1) == 4);  // "the lazy fox sleeps"
+}
+
+TEST(text_column_dedupes_a_repeated_term_within_one_row) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("fox fox fox jumps"));
+    m.mark_live(0);
+
+    uint32_t fox = 999;
+    ASSERT(m.text_term_code(0, "fox", fox));
+    // One posting per row, not per occurrence — doc_freq counts documents, not term
+    // occurrences (that distinction is what BM25's `df` needs to mean).
+    const std::vector<InternalId> want = {0};
+    EXPECT(m.postings(0, fox) == want);
+    EXPECT(m.count(0, fox) == 1);
+    // doc_len is still every token, occurrences included — BM25's length norm cares
+    // about document length, not vocabulary size.
+    EXPECT(m.text_doc_len(0, 0) == 4);
+}
+
+TEST(text_column_doc_freq_stays_zero_until_marked_live) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("hello world"));
+
+    uint32_t hello = 999;
+    ASSERT(m.text_term_code(0, "hello", hello));
+    EXPECT(m.count(0, hello) == 0);  // pending, not yet published
+
+    m.mark_live(0);
+    EXPECT(m.count(0, hello) == 1);
+
+    m.mark_dead(0);
+    EXPECT(m.count(0, hello) == 0);
+}
+
+TEST(text_column_set_row_moves_doc_freq_between_values) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("hello world"));
+    m.mark_live(0);
+
+    uint32_t hello = 999, goodbye = 999;
+    ASSERT(m.text_term_code(0, "hello", hello));
+    EXPECT(m.count(0, hello) == 1);
+
+    m.set_row(0, text_row("goodbye world"));
+    ASSERT(m.text_term_code(0, "goodbye", goodbye));
+    EXPECT(m.count(0, hello) == 0);    // old value's contribution released
+    EXPECT(m.count(0, goodbye) == 1);  // new value counted
+    EXPECT(m.get(0, 0).text == "goodbye world");  // raw text updated too
+}
+
+TEST(text_column_get_row_returns_exact_original_text) {
+    MetadataStore m(text_schema());
+    // Tokenization is lossy (case, punctuation, word order); get()/get_row() must
+    // still return exactly what was written — that's the raw_text array's whole job.
+    m.append_row(text_row("The Quick, Brown Fox!!"));
+    EXPECT(m.get(0, 0).text == "The Quick, Brown Fox!!");
+    EXPECT(m.get_row(0).attrs[0].text == "The Quick, Brown Fox!!");
+}
+
+TEST(text_column_null_value_has_no_terms_and_zero_doc_len) {
+    MetadataStore m(text_schema());
+    Record r;
+    r.attrs = {attr_null(), attr_tag("misc")};
+    m.append_row(r);
+    m.mark_live(0);
+
+    EXPECT(!m.present(0, 0));
+    EXPECT(m.text_doc_len(0, 0) == 0);
+    EXPECT(m.get(0, 0).is_null());
+}
+
+TEST(metadata_rejects_an_indexed_text_column) {
+    std::vector<AttrSpec> schema = {{"title", AttrType::Text, /*indexed=*/true}};
+    bool threw = false;
+    try {
+        MetadataStore m(schema);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT(threw);
+}
+
+TEST(vdb_insert_and_remove_maintain_live_doc_freq) {
+    VDB db(text_config());
+    const float v[2] = {0.0f, 0.0f};
+
+    const ExternalId a = db.insert(v, text_row("the quick fox"));
+    const ExternalId b = db.insert(v, text_row("the lazy dog"));
+
+    // title is attr 0; "the" is the first term interned (row a, first-seen order).
+    EXPECT(db.attr_count(0, 0 /*the*/) == 2);
+    EXPECT(db.attr_count(0, 1 /*quick*/) == 1);
+
+    ASSERT(db.remove(a));
+    EXPECT(db.attr_count(0, 0 /*the*/) == 1);   // row b's "the" still live
+    EXPECT(db.attr_count(0, 1 /*quick*/) == 0);  // was only in row a
+
+    ASSERT(db.remove(b));
+    EXPECT(db.attr_count(0, 0 /*the*/) == 0);
+}
+
+TEST(compact_permutes_text_columns_with_internal_ids) {
+    VDB db(text_config(IndexKind::HNSW));
+    std::vector<ExternalId> ids;
+    for (int i = 0; i < 10; ++i) {
+        const float v[2] = {static_cast<float>(i), static_cast<float>(i)};
+        ids.push_back(db.insert(v, text_row("title number " + std::to_string(i),
+                                            i % 2 == 0 ? "even" : "odd",
+                                            bytes("p" + std::to_string(i)))));
+    }
+    for (int i = 0; i < 10; i += 2) ASSERT(db.remove(ids[i]));  // tombstone the evens
+    ASSERT(db.deleted_count() == 5);
+
+    db.compact();
+    EXPECT(db.deleted_count() == 0);
+    EXPECT(db.size() == 5);
+
+    // Every surviving row keeps its exact original text after renumbering.
+    for (int i = 1; i < 10; i += 2) {
+        Record got;
+        ASSERT(db.get_metadata(ids[i], got));
+        EXPECT(got.attrs[0].text == "title number " + std::to_string(i));
+    }
+    // "number" (row 0's text is "title number 0" -> tokens "title","number","0", so
+    // "number" is the second term ever interned, code 1) was written by all 10
+    // original rows; only the 5 odd survivors remain live post-compact. This only
+    // passes if postings were rebuilt against the *new* internal ids rather than
+    // left pointing at renumbered-away rows (permute()'s whole point).
+    EXPECT(db.attr_count(0, /*"number", second term interned*/ 1) == 5);
+}
+
+TEST(snapshot_round_trips_text_metadata) {
+    const std::string dir = temp_dir("snaptext");
+    std::filesystem::create_directories(dir);
+    const std::string path = dir + "/snapshot";
+
+    std::vector<ExternalId> ids;
+    {
+        VDB db(text_config());
+        for (int i = 0; i < 5; ++i) {
+            const float v[2] = {static_cast<float>(i), 0.0f};
+            ids.push_back(db.insert(v, text_row("post number " + std::to_string(i),
+                                                i % 2 ? "shoes" : "hats",
+                                                bytes("pay" + std::to_string(i)))));
+        }
+        ASSERT(db.remove(ids[2]));
+        save_snapshot(db, path, /*lsn=*/42);
+    }
+
+    VDB restored(text_config());
+    EXPECT(load_snapshot(restored, path) == 42);
+    EXPECT(restored.size() == 4);
+
+    for (int i = 0; i < 5; ++i) {
+        Record got;
+        if (i == 2) { EXPECT(!restored.get_metadata(ids[i], got)); continue; }
+        ASSERT(restored.get_metadata(ids[i], got));
+        EXPECT(got.attrs[0].text == "post number " + std::to_string(i));
+        EXPECT(got.payload == bytes("pay" + std::to_string(i)));
+    }
+    // Counts/postings are derived, not serialized — this only proves anything if
+    // rebuild_derived_state() actually rebuilt text_terms + doc_freq on load.
+    EXPECT(restored.attr_count(0, 0 /*"post", first-seen*/) == 4);  // all 4 live rows
+    std::filesystem::remove_all(dir);
+}
+
+TEST(wal_record_round_trips_text_metadata) {
+    WalRecord in{WalRecordType::Insert, /*lsn=*/7, /*ext_id=*/3, {1.0f, 2.0f}, {}};
+    in.meta = text_row("The Quick, Brown Fox!!", "shoes", bytes("blob"));
+
+    const auto frame = encode_record(in);
+    WalRecord out;
+    size_t    consumed = 0;
+    ASSERT(decode_record(frame.data(), frame.size(), out, consumed) == DecodeStatus::Ok);
+    EXPECT(consumed == frame.size());
+    ASSERT(out.meta.attrs.size() == 2);
+    EXPECT(out.meta.attrs[0].type == AttrType::Text);
+    // WAL logs the raw string exactly, same as Tag's — B3's "log raw text, not the
+    // built index" is what makes this assertion meaningful.
+    EXPECT(out.meta.attrs[0].text == "The Quick, Brown Fox!!");
+    EXPECT(out.meta.attrs[1].text == "shoes");
+    EXPECT(out.meta.payload == bytes("blob"));
+}
+
+TEST(durable_recovery_restores_text_metadata) {
+    const std::string dir = temp_dir("durabletext");
+    std::vector<ExternalId> ids;
+    {
+        DurableVDB db(text_config(), dir);
+        for (int i = 0; i < 4; ++i) {
+            const float v[2] = {static_cast<float>(i), 0.0f};
+            ids.push_back(db.insert(v, text_row("doc number " + std::to_string(i))));
+        }
+        ASSERT(db.set_metadata(ids[1], text_row("replaced text")));
+        ASSERT(db.remove(ids[2]));
+        db.sync();
+    }
+
+    DurableVDB reopened(text_config(), dir);
+    EXPECT(reopened.size() == 3);
+
+    Record got;
+    ASSERT(reopened.get_metadata(ids[1], got));
+    EXPECT(got.attrs[0].text == "replaced text");  // SetMeta replayed
+
+    EXPECT(!reopened.get_metadata(ids[2], got));  // deleted
+
+    ASSERT(reopened.get_metadata(ids[3], got));
+    EXPECT(got.attrs[0].text == "doc number 3");
+
+    // "doc"/"number" appear in ids[0] and ids[3] (both still live); ids[1] was
+    // replaced, ids[2] tombstoned — replay must have rebuilt doc_freq correctly.
+    EXPECT(reopened.attr_count(0, 0 /*"doc", first-seen*/) == 2);
     std::filesystem::remove_all(dir);
 }
