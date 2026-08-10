@@ -142,6 +142,35 @@ public:
     std::vector<Hit> search_text(size_t attr, const std::string& query, size_t K, float k1 = 1.2f,
                                  float b = 0.75f) const;
 
+    // Same, but gated by `pred` first (Phase A) — the predicate is resolved once and
+    // its allowlist passed to MetadataStore::search_text, which restricts candidates
+    // to it. Same unresolved-predicate throw as the vector-search predicate overloads.
+    std::vector<Hit> search_text(size_t attr, const std::string& query, size_t K, const Predicate& pred,
+                                 float k1 = 1.2f, float b = 0.75f) const;
+
+    // Hybrid search (Phase B, B5): runs the vector ranker and B4's lexical ranker
+    // independently — each over `depth` candidates (0 means "use K") — and merges
+    // them by Reciprocal Rank Fusion: a result at (1-indexed) rank r in a ranker's
+    // list contributes 1/(rrf_k + r) to its fused score, summed across whichever
+    // ranker(s) returned it. Fusion is by *rank*, not raw score, on purpose — a
+    // vector distance and a BM25 score aren't on the same scale, so combining them
+    // directly would be meaningless. `Hit::dist` on the result is this fused score
+    // (higher is better, sorted descending), the same convention search_text
+    // already established. `depth` is not over-fetched beyond what's asked — a
+    // result ranked outside both rankers' top-`depth` cannot surface in the fusion,
+    // a known and deliberately simple starting point (see
+    // docs/plans/HYBRID_SEARCH_PLAN.md's B5 note).
+    std::vector<Hit> search_hybrid(const float* query_vec, size_t text_attr, const std::string& query_text,
+                                   size_t K, size_t depth = 0, double rrf_k = 60.0) const;
+
+    // Same, but `pred` gates *both* rankers before fusion (Phase A x B decision #5
+    // — docs/plans/HYBRID_SEARCH_PLAN.md): every fused candidate already satisfies
+    // `pred`, since each ranker only ever considered matching rows in the first
+    // place. Same unresolved-predicate throw as the other predicate overloads.
+    std::vector<Hit> search_hybrid(const float* query_vec, size_t text_attr, const std::string& query_text,
+                                   size_t K, const Predicate& pred, size_t depth = 0,
+                                   double rrf_k = 60.0) const;
+
     // Rebuild the index from live vectors only, reclaiming tombstoned space.
     // External ids are preserved; internal ids are renumbered.
     void compact();
@@ -242,6 +271,14 @@ private:
     // Caller must hold mu_; `allowlist` is assumed already live-filtered.
     std::vector<std::pair<InternalId, float>> prefilter_scan_(
         const float* query, size_t K, const std::vector<InternalId>& allowlist) const;
+
+    // Reciprocal Rank Fusion of two independently-ranked Hit lists — see
+    // search_hybrid's doc comment for the formula and the rank-not-raw-score
+    // rationale. Not synchronised itself (pure function of its inputs); the two
+    // search_hybrid overloads each take mu_ shared via the calls that produce `a`
+    // and `b` before this runs.
+    std::vector<Hit> rrf_fuse_(const std::vector<Hit>& a, const std::vector<Hit>& b, size_t K,
+                              double rrf_k) const;
 
     static std::unique_ptr<Index> make_index_(const VDBConfig& cfg);
 };

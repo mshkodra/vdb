@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <unordered_map>
 #include <utility>
 
 namespace vdb {
@@ -354,12 +355,79 @@ std::vector<Hit> VDB::search_text(size_t attr, const std::string& query, size_t 
     if (K == 0) return {};
     std::shared_lock<std::shared_mutex> lk(mu_);
 
-    const auto matches = meta_.search_text(attr, query, K, deleted_, k1, b);
+    const auto matches = meta_.search_text(attr, query, K, deleted_, /*allowlist=*/nullptr, k1, b);
     std::vector<Hit> out;
     out.reserve(matches.size());
     for (const auto& m : matches)
         out.push_back(Hit{int_to_ext_[m.id], m.score, meta_.payload(m.id)});
     return out;
+}
+
+std::vector<Hit> VDB::search_text(size_t attr, const std::string& query, size_t K,
+                                  const Predicate& pred, float k1, float b) const {
+    if (K == 0) return {};
+    std::shared_lock<std::shared_mutex> lk(mu_);
+
+    ResolvedPredicate resolved = meta_.resolve(pred, deleted_);
+    if (!resolved.allowlist)
+        throw std::invalid_argument(
+            "search_text: predicate did not resolve to an allowlist (range on a "
+            "non-indexed column) — per-candidate evaluation isn't supported yet");
+
+    const auto matches = meta_.search_text(attr, query, K, deleted_, &*resolved.allowlist, k1, b);
+    std::vector<Hit> out;
+    out.reserve(matches.size());
+    for (const auto& m : matches)
+        out.push_back(Hit{int_to_ext_[m.id], m.score, meta_.payload(m.id)});
+    return out;
+}
+
+std::vector<Hit> VDB::rrf_fuse_(const std::vector<Hit>& a, const std::vector<Hit>& b, size_t K,
+                               double rrf_k) const {
+    std::unordered_map<ExternalId, double> score;
+    std::unordered_map<ExternalId, const std::vector<uint8_t>*> payload_of;
+    auto fold = [&](const std::vector<Hit>& hits) {
+        for (size_t i = 0; i < hits.size(); ++i) {
+            score[hits[i].id] += 1.0 / (rrf_k + static_cast<double>(i + 1));
+            payload_of.emplace(hits[i].id, &hits[i].payload);  // first writer wins; identical either way
+        }
+    };
+    fold(a);
+    fold(b);
+
+    std::vector<std::pair<ExternalId, double>> ranked(score.begin(), score.end());
+    const size_t take = std::min(K, ranked.size());
+    std::partial_sort(ranked.begin(), ranked.begin() + take, ranked.end(),
+                      [](const auto& x, const auto& y) { return x.second > y.second; });
+    ranked.resize(take);
+
+    std::vector<Hit> out;
+    out.reserve(take);
+    for (const auto& [id, s] : ranked)
+        out.push_back(Hit{id, static_cast<float>(s), *payload_of[id]});
+    return out;
+}
+
+std::vector<Hit> VDB::search_hybrid(const float* query_vec, size_t text_attr,
+                                    const std::string& query_text, size_t K, size_t depth,
+                                    double rrf_k) const {
+    if (K == 0) return {};
+    if (depth == 0) depth = K;
+
+    const auto vec_hits = search_hits(query_vec, depth);
+    const auto lex_hits = search_text(text_attr, query_text, depth);
+    return rrf_fuse_(vec_hits, lex_hits, K, rrf_k);
+}
+
+std::vector<Hit> VDB::search_hybrid(const float* query_vec, size_t text_attr,
+                                    const std::string& query_text, size_t K, const Predicate& pred,
+                                    size_t depth, double rrf_k) const {
+    if (K == 0) return {};
+    if (depth == 0) depth = K;
+
+    const auto vec_hits = search_hits_auto(query_vec, depth, pred);
+    const auto lex_hits = search_text(text_attr, query_text, depth, pred);
+    return rrf_fuse_(vec_hits, lex_hits, K, rrf_k);
 }
 
 std::vector<std::pair<InternalId, float>> VDB::prefilter_scan_(

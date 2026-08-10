@@ -355,11 +355,18 @@ public:
     // over half the corpus, which would let a "common" term actively *hurt* a
     // document's score instead of just contributing little.
     //
-    // Returns the top `K` live documents by score, descending. Throws
-    // std::invalid_argument if `attr` isn't a Text column.
+    // `allowlist`, when non-null, additionally restricts candidates to that id set
+    // — how a structured predicate (Phase A) gates this ranker for hybrid search
+    // (B5): the caller resolves the predicate once and passes its allowlist
+    // through, same as collect_/prefilter_scan_ take an already-resolved predicate
+    // rather than re-resolving per candidate.
+    //
+    // Returns the top `K` live (and, if `allowlist` is given, matching) documents by
+    // score, descending. Throws std::invalid_argument if `attr` isn't a Text column.
     std::vector<TextMatch> search_text(size_t attr, const std::string& query, size_t K,
-                                       const std::vector<bool>& deleted, float k1 = 1.2f,
-                                       float b = 0.75f) const;
+                                       const std::vector<bool>& deleted,
+                                       const std::vector<InternalId>* allowlist = nullptr,
+                                       float k1 = 1.2f, float b = 0.75f) const;
 
     void serialize(std::vector<uint8_t>& out) const;
     void deserialize(Reader& r);
