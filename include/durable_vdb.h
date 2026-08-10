@@ -65,6 +65,27 @@ public:
     std::vector<Hit> search_hits(const float* query, size_t K) const {
         return db_.search_hits(query, K);
     }
+    // Forwarded for the gRPC service (server/vdb_server.cpp) — added after VDB's own
+    // Phase B methods, same reason search_hits already forwards: reads pass straight
+    // through, no durability/WAL concern for a read path.
+    std::vector<Hit> search_text(size_t attr, const std::string& query, size_t K, float k1 = 1.2f,
+                                 float b = 0.75f) const {
+        return db_.search_text(attr, query, K, k1, b);
+    }
+    std::vector<Hit> search_text(size_t attr, const std::string& query, size_t K,
+                                 const Predicate& pred, float k1 = 1.2f, float b = 0.75f) const {
+        return db_.search_text(attr, query, K, pred, k1, b);
+    }
+    std::vector<Hit> search_hybrid(const float* query_vec, size_t text_attr,
+                                   const std::string& query_text, size_t K, size_t depth = 0,
+                                   double rrf_k = 60.0) const {
+        return db_.search_hybrid(query_vec, text_attr, query_text, K, depth, rrf_k);
+    }
+    std::vector<Hit> search_hybrid(const float* query_vec, size_t text_attr,
+                                   const std::string& query_text, size_t K, const Predicate& pred,
+                                   size_t depth = 0, double rrf_k = 60.0) const {
+        return db_.search_hybrid(query_vec, text_attr, query_text, K, pred, depth, rrf_k);
+    }
     bool get_metadata(ExternalId id, Record& out) const {
         return db_.get_metadata(id, out);
     }

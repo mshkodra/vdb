@@ -1,0 +1,104 @@
+// Wire surface for the hybrid-search service (Phase B, B6 —
+// docs/plans/HYBRID_SEARCH_PLAN.md, kept local). Scoped to the exact schema
+// bench/hybrid.cpp already uses (description: Text, category: Tag) rather than an
+// arbitrary AttrSpec schema — a general schema-configurable service is a bigger
+// feature than this, not built here.
+//
+// `vdbproto`, not `vdb`, on purpose: protoc generates C++ classes in a namespace
+// matching the package name, and this server links against the hand-written
+// `vdb::` namespace (VDB, Predicate, Record, ...) — sharing the name would nest
+// generated and hand-written code together in a way that invites confusion.
+syntax = "proto3";
+
+package vdbproto;
+
+service VDBService {
+  // Insert a vector with its description/category metadata. `vector` must have
+  // exactly the server's configured dim (128).
+  rpc Insert(InsertRequest) returns (InsertResponse);
+
+  // Tombstone a previously inserted id. `removed` is false if `id` was unknown.
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+
+  // Plain nearest-neighbour vector search — no text involved.
+  rpc SearchVector(SearchVectorRequest) returns (SearchResponse);
+
+  // BM25 lexical search over `description`. `category`, if non-empty, gates
+  // results to that category (Predicate::Eq under the hood).
+  rpc SearchText(SearchTextRequest) returns (SearchResponse);
+
+  // Reciprocal Rank Fusion of vector + lexical search
+  // (vdb::VDB::search_hybrid). `category`, if non-empty, gates *both* rankers
+  // before fusion, not applied after.
+  rpc SearchHybrid(SearchHybridRequest) returns (SearchResponse);
+
+  // Read back one row's metadata by id.
+  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+
+  // Live / tombstoned row counts.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+message InsertRequest {
+  repeated float vector = 1;
+  string description = 2;
+  string category = 3;
+}
+message InsertResponse {
+  uint64 id = 1;
+}
+
+message RemoveRequest {
+  uint64 id = 1;
+}
+message RemoveResponse {
+  bool removed = 1;
+}
+
+message SearchVectorRequest {
+  repeated float vector = 1;
+  uint32 k = 2;
+}
+
+message SearchTextRequest {
+  string query = 1;
+  uint32 k = 2;
+  string category = 3;  // empty = no filter
+}
+
+message SearchHybridRequest {
+  repeated float vector = 1;
+  string query = 2;
+  uint32 k = 3;
+  uint32 depth = 4;      // 0 = use k (see VDB::search_hybrid's own doc comment)
+  string category = 5;   // empty = no filter
+}
+
+// `score`'s sense depends on which RPC produced it: SearchVector's score is a
+// vector distance (lower is better); SearchText's and SearchHybrid's score is a
+// BM25 / RRF-fused score (higher is better) — the same asymmetry
+// vdb::Hit::dist already carries in the C++ API, not introduced here.
+message Hit {
+  uint64 id = 1;
+  float score = 2;
+  string description = 3;
+  string category = 4;
+}
+message SearchResponse {
+  repeated Hit hits = 1;
+}
+
+message GetMetadataRequest {
+  uint64 id = 1;
+}
+message GetMetadataResponse {
+  bool found = 1;
+  string description = 2;
+  string category = 3;
+}
+
+message StatsRequest {}
+message StatsResponse {
+  uint64 size = 1;           // live rows
+  uint64 deleted_count = 2;  // tombstoned rows
+}
