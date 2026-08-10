@@ -288,13 +288,27 @@ void run_sift(const char* data_dir, const char* methods, const char* label_arg) 
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // live progress even when piped
     const std::string dir = data_dir;
     const std::string which = methods ? methods : "all";
-    // `which` is "all" or a comma list of {brute,ivf,hnsw}, optionally with the
-    // token "rebuild" to bypass the snapshot cache and force a fresh build.
-    const bool run_all       = which.find("all") != std::string::npos;
-    const bool force_rebuild = which.find("rebuild") != std::string::npos;
-    auto want = [&](const char* m) {
-        return run_all || which.find(m) != std::string::npos;
+    // `which` is "all" or a comma list of {brute,ivf,hnsw,hnsw_int8}, optionally
+    // with the token "rebuild" to bypass the snapshot cache and force a fresh
+    // build. Split into exact tokens, not raw substring search — "hnsw_int8"
+    // contains "hnsw" as a substring, so a naive which.find("hnsw") would fire on
+    // a "hnsw_int8"-only invocation too (found the hard way: it silently
+    // re-appended a duplicate set of "hnsw" rows into the CSV).
+    std::vector<std::string> tokens;
+    {
+        std::string cur;
+        for (char c : which) {
+            if (c == ',') { tokens.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        tokens.push_back(cur);
+    }
+    auto has_token = [&](const char* m) {
+        return std::find(tokens.begin(), tokens.end(), std::string(m)) != tokens.end();
     };
+    const bool run_all       = has_token("all");
+    const bool force_rebuild = has_token("rebuild");
+    auto want = [&](const char* m) { return run_all || has_token(m); };
     // A subset run appends to the CSV so methods can be filled in independently.
     const bool append = !run_all;
 
@@ -410,6 +424,59 @@ void run_sift(const char* data_dir, const char* methods, const char* label_arg) 
                 double rec = recall_at_k(hnsw, gt.data(), gt_dim, queries.data(), q_recall, K);
                 auto ts = time_queries(hnsw, queries.data(), q_timing, K, TIMING_REPS);
                 rows.push_back({"hnsw", "ef", (long)K, (long)ef, build, rec, ts.qps,
+                                ts.mean_us, ts.p50_us, ts.p95_us, ts.p99_us});
+                std::printf("  ef=%-4zu K=%-3zu recall@%zu %.4f | %8.1f QPS | "
+                            "p95 %.0f us\n", ef, K, K, rec, ts.qps, ts.p95_us);
+            }
+        }
+    }
+
+    // ---- HNSW, int8-quantized (HNSWIndex<L2Int8, int8_t>): same graph algorithm
+    //      and same ef sweep as [hnsw] above, but nodes store int8 instead of
+    //      float (4x smaller per-vector footprint) — see hnsw_index.h's Elem
+    //      template parameter. Not part of "all": it needs its own ~1M-insert
+    //      build the first time (same cost class as [hnsw]'s build), so it's
+    //      opt-in via an explicit "hnsw_int8" token, same as any other method. ----
+    // has_token(), not want(): want("hnsw_int8") would return true under a plain
+    // "all" run too (run_all short-circuits every want() check), and this method
+    // needs its own ~1M-insert build the first time — an explicit "hnsw_int8"
+    // token only, never implied by "all".
+    if (has_token("hnsw_int8")) {
+        vdb::HNSWIndex<vdb::L2Int8, int8_t> hnsw_i8(
+            {DIM, HNSW_M, HNSW_M, 2 * HNSW_M, HNSW_EFC, 0.0f});
+        const std::string cache = cache_dir + "/hnsw_int8.snap";
+        const std::vector<uint64_t> params = {DIM, n_base, HNSW_M, HNSW_EFC};
+        double build = 0.0;
+        if (!force_rebuild && load_index_snapshot(cache, params, hnsw_i8, build)) {
+            std::printf("\n[HNSW-int8]  loaded cache %s (M=%zu, orig build %.0f ms)\n",
+                        cache.c_str(), HNSW_M, build);
+        } else {
+            std::printf("\n[HNSW-int8]  training (calibrating quantization scale over "
+                        "%zu vectors)...\n", n_base);
+            hnsw_i8.train(base.data(), n_base);  // must run before the first add()
+            std::printf("[HNSW-int8]  building (M=%zu, efC=%zu) — 1M serial inserts...\n",
+                        HNSW_M, HNSW_EFC);
+            build = build_ms_of([&] {
+                for (size_t i = 0; i < n_base; ++i) {
+                    hnsw_i8.add(base.data() + i * DIM);
+                    if ((i + 1) % 100000 == 0)
+                        std::printf("    ... %zu / %zu inserted\n", i + 1, n_base);
+                }
+            });
+            std::printf("  build %.0f ms\n", build);
+            save_index_snapshot(cache, build, params, hnsw_i8);
+            std::printf("  cached -> %s\n", cache.c_str());
+        }
+
+        const std::vector<size_t>* ef_grid[2] = {&HNSW_EF_K10, &HNSW_EF_K100};
+        for (size_t ki = 0; ki < RECALL_K.size(); ++ki) {
+            size_t K = RECALL_K[ki];
+            const auto& efs = *ef_grid[std::min(ki, (size_t)1)];
+            for (size_t ef : efs) {
+                hnsw_i8.set_ef_search(ef);
+                double rec = recall_at_k(hnsw_i8, gt.data(), gt_dim, queries.data(), q_recall, K);
+                auto ts = time_queries(hnsw_i8, queries.data(), q_timing, K, TIMING_REPS);
+                rows.push_back({"hnsw_int8", "ef", (long)K, (long)ef, build, rec, ts.qps,
                                 ts.mean_us, ts.p50_us, ts.p95_us, ts.p99_us});
                 std::printf("  ef=%-4zu K=%-3zu recall@%zu %.4f | %8.1f QPS | "
                             "p95 %.0f us\n", ef, K, K, rec, ts.qps, ts.p95_us);
