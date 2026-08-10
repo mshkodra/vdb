@@ -1417,3 +1417,146 @@ TEST(durable_recovery_restores_text_metadata) {
     EXPECT(reopened.attr_count(0, 0 /*"doc", first-seen*/) == 2);
     std::filesystem::remove_all(dir);
 }
+
+// ---- Phase B, B4: BM25 ranking (MetadataStore::search_text / VDB::search_text).
+//      RRF fusion (B5) and the wire surface (B6) are not built yet. ----
+
+TEST(text_live_count_and_avg_doc_len_track_mark_live_and_mark_dead) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("a b c"));      // 3 tokens
+    m.append_row(text_row("a b c d e"));  // 5 tokens
+    EXPECT(m.text_live_count(0) == 0);
+    EXPECT(m.text_avg_doc_len(0) == 0.0);
+
+    m.mark_live(0);
+    EXPECT(m.text_live_count(0) == 1);
+    EXPECT(m.text_avg_doc_len(0) == 3.0);
+
+    m.mark_live(1);
+    EXPECT(m.text_live_count(0) == 2);
+    EXPECT(m.text_avg_doc_len(0) == 4.0);  // (3+5)/2
+
+    m.mark_dead(0);
+    EXPECT(m.text_live_count(0) == 1);
+    EXPECT(m.text_avg_doc_len(0) == 5.0);
+}
+
+TEST(bm25_ranks_higher_term_frequency_first_when_length_is_equal) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("fox fox jumps runs happy dog"));  // "fox" x2, 6 tokens
+    m.append_row(text_row("fox jumps runs happy dog cat"));  // "fox" x1, 6 tokens
+    m.mark_live(0);
+    m.mark_live(1);
+
+    const std::vector<bool> deleted(2, false);
+    const auto results = m.search_text(0, "fox", 2, deleted);
+    ASSERT(results.size() == 2);
+    // Equal length -> equal length-norm term, so the only thing that can separate
+    // them is term frequency (2 vs 1), and BM25's tf-saturation term is monotone
+    // increasing in tf for a fixed norm.
+    EXPECT(results[0].id == 0);
+    EXPECT(results[1].id == 1);
+    EXPECT(results[0].score > results[1].score);
+}
+
+TEST(bm25_weights_rarer_terms_higher_via_idf) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("common filler filler filler"));  // "common": df=3
+    m.append_row(text_row("common filler filler filler"));
+    m.append_row(text_row("common filler filler filler"));
+    m.append_row(text_row("rare filler filler filler"));    // "rare": df=1
+    m.append_row(text_row("filler filler filler filler"));
+    for (int i = 0; i < 5; ++i) m.mark_live(i);
+
+    const std::vector<bool> deleted(5, false);
+    const auto common_hit = m.search_text(0, "common", 1, deleted);
+    const auto rare_hit   = m.search_text(0, "rare", 1, deleted);
+    ASSERT(common_hit.size() == 1);
+    ASSERT(rare_hit.size() == 1);
+    // Same tf (1) and same doc length (4 tokens) for the matching row in both
+    // queries — df (3 vs 1) is the only difference, so idf alone must explain a
+    // higher score for the rarer term.
+    EXPECT(rare_hit[0].score > common_hit[0].score);
+}
+
+TEST(bm25_query_repetition_does_not_change_the_score) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("fox jumps over the lazy dog"));
+    m.mark_live(0);
+    const std::vector<bool> deleted(1, false);
+
+    const auto once  = m.search_text(0, "fox", 1, deleted);
+    const auto thrice = m.search_text(0, "fox fox fox", 1, deleted);
+    ASSERT(once.size() == 1);
+    ASSERT(thrice.size() == 1);
+    // Query terms are a set, not frequency-weighted — see search_text's doc comment.
+    EXPECT(once[0].score == thrice[0].score);
+}
+
+TEST(bm25_excludes_tombstoned_documents_from_results) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("fox jumps over the lazy dog"));
+    m.append_row(text_row("cats and dogs"));
+    m.mark_live(0);
+    m.mark_live(1);
+
+    const std::vector<bool> deleted = {true, false};  // row 0 tombstoned
+    const auto results = m.search_text(0, "fox", 5, deleted);
+    EXPECT(results.empty());  // the only match was on the tombstoned row
+}
+
+TEST(bm25_query_with_no_indexed_terms_returns_empty) {
+    MetadataStore m(text_schema());
+    m.append_row(text_row("fox jumps over the lazy dog"));
+    m.mark_live(0);
+    const std::vector<bool> deleted(1, false);
+
+    EXPECT(m.search_text(0, "elephant giraffe", 5, deleted).empty());
+}
+
+TEST(bm25_respects_the_k_limit) {
+    MetadataStore m(text_schema());
+    for (int i = 0; i < 5; ++i) {
+        m.append_row(text_row("fox jumps over the lazy dog"));
+        m.mark_live(i);
+    }
+    const std::vector<bool> deleted(5, false);
+    EXPECT(m.search_text(0, "fox", 3, deleted).size() == 3);
+}
+
+TEST(bm25_throws_on_a_non_text_column) {
+    MetadataStore m(text_schema());  // attr 1 ("category") is Tag, not Text
+    bool threw = false;
+    try {
+        m.search_text(1, "shoes", 5, std::vector<bool>{});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    EXPECT(threw);
+}
+
+TEST(vdb_search_text_returns_bm25_ranked_hits_with_payload) {
+    VDB db(text_config());
+    const float v[2] = {0.0f, 0.0f};
+    const ExternalId a = db.insert(v, text_row("fox fox jumps happy", "misc", bytes("A")));  // fox x2
+    const ExternalId b = db.insert(v, text_row("fox runs happy dog", "misc", bytes("B")));   // fox x1
+    db.insert(v, text_row("no match at all here", "misc", bytes("C")));
+
+    const auto hits = db.search_text(0, "fox", 5);
+    ASSERT(hits.size() == 2);
+    EXPECT(hits[0].id == a);
+    EXPECT(hits[0].payload == bytes("A"));
+    EXPECT(hits[1].id == b);
+    // Unlike a vector Hit, `dist` here is a BM25 score: higher is better.
+    EXPECT(hits[0].dist > hits[1].dist);
+}
+
+TEST(vdb_search_text_excludes_removed_documents) {
+    VDB db(text_config());
+    const float v[2] = {0.0f, 0.0f};
+    const ExternalId a = db.insert(v, text_row("fox jumps"));
+    db.insert(v, text_row("no match"));
+    ASSERT(db.remove(a));
+
+    EXPECT(db.search_text(0, "fox", 5).empty());
+}

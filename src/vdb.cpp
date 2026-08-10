@@ -349,6 +349,19 @@ std::vector<Hit> VDB::search_hits_auto(const float* query, size_t K, const Predi
     return out;
 }
 
+std::vector<Hit> VDB::search_text(size_t attr, const std::string& query, size_t K, float k1,
+                                  float b) const {
+    if (K == 0) return {};
+    std::shared_lock<std::shared_mutex> lk(mu_);
+
+    const auto matches = meta_.search_text(attr, query, K, deleted_, k1, b);
+    std::vector<Hit> out;
+    out.reserve(matches.size());
+    for (const auto& m : matches)
+        out.push_back(Hit{int_to_ext_[m.id], m.score, meta_.payload(m.id)});
+    return out;
+}
+
 std::vector<std::pair<InternalId, float>> VDB::prefilter_scan_(
     const float* query, size_t K, const std::vector<InternalId>& allowlist) const {
     switch (config_.metric) {
