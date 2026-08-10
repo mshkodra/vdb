@@ -34,4 +34,8 @@ FilterStrategy plan_strategy(const FilterCalibration& c, size_t N, size_t dim, s
     return post < pre ? FilterStrategy::Post : FilterStrategy::Pre;
 }
 
+FilterCalibration default_filter_calibration() {
+    return FilterCalibration{1.859288, 0.001214};
+}
+
 }

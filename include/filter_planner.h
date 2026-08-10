@@ -47,4 +47,11 @@ double predicted_pre_cost_us(const FilterCalibration& c, size_t N, size_t dim, d
 FilterStrategy plan_strategy(const FilterCalibration& c, size_t N, size_t dim, size_t K,
                              double s);
 
+// Baked-in calibration, fit from docs/results/filter_findings.md Run 3 (N=1,000,000
+// SIFT1M vectors, dim=128, HNSW). VDB uses this out of the box; it is fit to that
+// run's machine/dataset/HNSW config, not re-measured per deployment — a caller on
+// very different hardware, dim, or graph config can get a wrong-side-of-the-
+// crossover pick near the boundary (s≈0.90-0.95 in that run) until it recalibrates.
+FilterCalibration default_filter_calibration();
+
 }

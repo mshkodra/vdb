@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "distance.h"
+#include "filter_planner.h"
 #include "index.h"
 #include "metadata.h"
 
@@ -116,11 +117,19 @@ public:
 
     // Pre-filtered search: skip index_ entirely, brute-force scan just `pred`'s
     // (already live-filtered) allowlist. Wins over the post-filter overloads above
-    // when the predicate is selective; a distinct method rather than an automatic
-    // choice because that choice needs a cost model — PR 14's planner, not built yet.
-    // Same unresolved-predicate throw as the post-filter overloads.
+    // when the predicate is selective. Same unresolved-predicate throw as the
+    // post-filter overloads.
     std::vector<ExternalId> search_prefiltered(const float* query, size_t K, const Predicate& pred) const;
     std::vector<Hit> search_hits_prefiltered(const float* query, size_t K, const Predicate& pred) const;
+
+    // Cost-model-driven search: resolves `pred`, then picks pre- or post-filter via
+    // filter_planner's plan_strategy on filter_calibration_ (default: the fit baked
+    // into default_filter_calibration(), see docs/results/filter_findings.md Run 3).
+    // Same unresolved-predicate throw as the two explicit-strategy overloads above —
+    // there's no strategy to pick between when `pred` doesn't resolve to an
+    // allowlist, since pre-filter has nothing to scan.
+    std::vector<ExternalId> search_auto(const float* query, size_t K, const Predicate& pred) const;
+    std::vector<Hit> search_hits_auto(const float* query, size_t K, const Predicate& pred) const;
 
     // Rebuild the index from live vectors only, reclaiming tombstoned space.
     // External ids are preserved; internal ids are renumbered.
@@ -176,6 +185,12 @@ private:
     size_t     live_count_    = 0;
     size_t     deleted_count_ = 0;
 
+    // search_auto/search_hits_auto's cost model. Defaults to the baked-in fit from
+    // Run 3 of docs/results/filter_findings.md — see filter_planner.h's
+    // default_filter_calibration() doc comment for the hardware/dataset it's fit to
+    // and when it can mispredict.
+    FilterCalibration filter_calibration_ = default_filter_calibration();
+
     // Append `vec` as a fresh *live* internal node (single-phase add), keeping the
     // parallel arrays in step. Not synchronised — the caller must hold mu_ exclusive
     // (or be single-threaded, as in compact()).
@@ -197,6 +212,18 @@ private:
     // `emit`. Throws if `pred` doesn't resolve to an allowlist. Caller must hold mu_.
     template <class Emit>
     void collect_prefiltered_(const float* query, size_t K, const Predicate& pred, Emit&& emit) const;
+
+    // Shared body of the two auto-strategy search paths: resolve `pred` once, then —
+    // when it resolves to a non-empty index — compute exact selectivity
+    // s = |allowlist| / index_->size() (free, same derivation as collect_'s `want`
+    // comment) and ask plan_strategy() to pick Pre or Post. Pre-filter is served by
+    // prefilter_scan_ directly on the already-resolved allowlist (skips
+    // collect_prefiltered_'s redundant re-resolve); post-filter and the
+    // unresolved-predicate/empty-index cases fall through to collect_, which throws
+    // or returns empty exactly as the explicit-strategy overloads already do. Caller
+    // must hold mu_ (shared is enough).
+    template <class Emit>
+    void collect_auto_(const float* query, size_t K, const Predicate& pred, Emit&& emit) const;
 
     // Brute-force `Metric`-correct distance over just `allowlist`'s vectors, nearest
     // K first. Dispatches once on config_.metric to a templated inner loop (same

@@ -313,6 +313,42 @@ std::vector<Hit> VDB::search_hits(const float* query, size_t K, const Predicate&
     return out;
 }
 
+template <class Emit>
+void VDB::collect_auto_(const float* query, size_t K, const Predicate& pred, Emit&& emit) const {
+    ResolvedPredicate resolved = meta_.resolve(pred, deleted_);
+    const size_t       N       = index_->size();
+    if (resolved.allowlist && N > 0) {
+        const double s = static_cast<double>(resolved.allowlist->size()) / static_cast<double>(N);
+        if (plan_strategy(filter_calibration_, N, config_.dim, K, s) == FilterStrategy::Pre) {
+            for (auto& [iid, dist] : prefilter_scan_(query, K, *resolved.allowlist)) emit(iid, dist);
+            return;
+        }
+    }
+    collect_(query, K, emit, &resolved);
+}
+
+std::vector<ExternalId> VDB::search_auto(const float* query, size_t K, const Predicate& pred) const {
+    if (K == 0) return {};
+    std::shared_lock<std::shared_mutex> lk(mu_);
+
+    std::vector<ExternalId> out;
+    out.reserve(K);
+    collect_auto_(query, K, pred, [&](InternalId iid, float) { out.push_back(int_to_ext_[iid]); });
+    return out;
+}
+
+std::vector<Hit> VDB::search_hits_auto(const float* query, size_t K, const Predicate& pred) const {
+    if (K == 0) return {};
+    std::shared_lock<std::shared_mutex> lk(mu_);
+
+    std::vector<Hit> out;
+    out.reserve(K);
+    collect_auto_(query, K, pred, [&](InternalId iid, float dist) {
+        out.push_back(Hit{int_to_ext_[iid], dist, meta_.payload(iid)});
+    });
+    return out;
+}
+
 std::vector<std::pair<InternalId, float>> VDB::prefilter_scan_(
     const float* query, size_t K, const std::vector<InternalId>& allowlist) const {
     switch (config_.metric) {
