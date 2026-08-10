@@ -45,7 +45,7 @@ void put_meta(std::vector<uint8_t>& body, const Record& m) {
     for (const auto& a : m.attrs) {
         put(body, static_cast<uint8_t>(a.type));
         if (a.type == AttrType::Null) continue;
-        if (a.type == AttrType::Tag) {
+        if (a.type == AttrType::Tag || a.type == AttrType::Text) {
             put(body, static_cast<uint32_t>(a.text.size()));
             body.insert(body.end(), a.text.begin(), a.text.end());
         } else {
@@ -67,7 +67,8 @@ Record get_meta(Reader& rd) {
         v.type = static_cast<AttrType>(rd.get<uint8_t>());
         switch (v.type) {
             case AttrType::Null: break;
-            case AttrType::Tag: {
+            case AttrType::Tag:
+            case AttrType::Text: {
                 const uint32_t len = rd.get<uint32_t>();
                 v.text.resize(len);
                 for (uint32_t k = 0; k < len; ++k)

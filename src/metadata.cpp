@@ -1,7 +1,9 @@
 #include "metadata.h"
 
 #include <algorithm>
+#include <cctype>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace vdb {
 
@@ -14,11 +16,29 @@ const char* type_name(AttrType t) {
         case AttrType::Float64: return "float64";
         case AttrType::Bool:    return "bool";
         case AttrType::Tag:     return "tag";
+        case AttrType::Text:    return "text";
     }
     return "?";
 }
 
 }  // namespace
+
+std::vector<std::string> tokenize_text(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    auto flush = [&] {
+        if (!cur.empty()) {
+            out.push_back(cur);
+            cur.clear();
+        }
+    };
+    for (unsigned char ch : s) {
+        if (std::isalnum(ch)) cur.push_back(static_cast<char>(std::tolower(ch)));
+        else flush();
+    }
+    flush();
+    return out;
+}
 
 MetadataStore::MetadataStore(std::vector<AttrSpec> schema) : schema_(std::move(schema)) {
     columns_.resize(schema_.size());
@@ -88,21 +108,52 @@ uint32_t MetadataStore::intern_(Column& c, const std::string& s) {
     return code;
 }
 
-// Tag/Bool only; a no-op for any other column. `increment` is the row's current
-// contribution being added or removed from that value's live count.
+std::vector<uint32_t> MetadataStore::intern_terms_(Column& c, const std::string& text,
+                                                    uint32_t& out_doc_len) {
+    const std::vector<std::string> tokens = tokenize_text(text);
+    out_doc_len = static_cast<uint32_t>(tokens.size());  // occurrences included
+
+    std::vector<uint32_t> codes;
+    std::unordered_set<uint32_t> seen;  // de-dupe: a repeated term posts once per row
+    for (const std::string& tok : tokens) {
+        const uint32_t code = intern_(c, tok);
+        if (seen.insert(code).second) codes.push_back(code);
+    }
+    return codes;
+}
+
+// Tag/Bool/Text only; a no-op for any other column. `increment` is the row's
+// current contribution being added or removed from each affected value's live
+// count. Text differs from Tag/Bool only in fan-out: one row can carry many term
+// codes (text_terms[id]) instead of the single code c.data[id] holds.
 void MetadataStore::adjust_count_(size_t a, InternalId id, bool increment) {
     Column& c = columns_[a];
-    if ((c.type != AttrType::Tag && c.type != AttrType::Bool) || !c.present[id]) return;
+    if (!c.present[id]) return;
+    if (c.type == AttrType::Text) {
+        for (uint32_t code : c.text_terms[id]) {
+            if (increment) ++c.count[code];
+            else           --c.count[code];
+        }
+        return;
+    }
+    if (c.type != AttrType::Tag && c.type != AttrType::Bool) return;
     const uint32_t code = static_cast<uint32_t>(c.data[id]);
     if (increment) ++c.count[code];
     else           --c.count[code];
 }
 
-// Tag/Bool only; a no-op for any other column or an absent value. Never removes an
-// existing entry — see the postings() accessor's doc comment for why.
+// Tag/Bool/Text only; a no-op for any other column or an absent value. Never
+// removes an existing entry — see the postings() accessor's doc comment for why.
+// Text posts once per unique term in the row (text_terms is already de-duplicated
+// by intern_terms_), not once per occurrence.
 void MetadataStore::add_posting_(size_t a, InternalId id) {
     Column& c = columns_[a];
-    if ((c.type != AttrType::Tag && c.type != AttrType::Bool) || !c.present[id]) return;
+    if (!c.present[id]) return;
+    if (c.type == AttrType::Text) {
+        for (uint32_t code : c.text_terms[id]) c.postings[code].push_back(id);
+        return;
+    }
+    if (c.type != AttrType::Tag && c.type != AttrType::Bool) return;
     const uint32_t code = static_cast<uint32_t>(c.data[id]);
     c.postings[code].push_back(id);
 }
@@ -140,7 +191,7 @@ void MetadataStore::mark_dead(InternalId id) {
 
 void MetadataStore::rebuild_derived_state(const std::vector<bool>& deleted) {
     for (auto& c : columns_) {
-        if (c.type == AttrType::Tag || c.type == AttrType::Bool) {
+        if (c.type == AttrType::Tag || c.type == AttrType::Bool || c.type == AttrType::Text) {
             std::fill(c.count.begin(), c.count.end(), 0u);
             for (auto& p : c.postings) p.clear();
         }
@@ -175,12 +226,28 @@ void MetadataStore::append_row(const Record& rec) {
         if (rec.attrs.empty() || rec.attrs[a].is_null()) {
             c.data.push_back(0);
             c.present.push_back(false);
+            if (c.type == AttrType::Text) {
+                c.text_terms.emplace_back();
+                c.doc_len.push_back(0);
+                c.raw_text.emplace_back();
+            }
             continue;
         }
         const AttrValue& v = rec.attrs[a];
-        // Tag values arrive as strings and are interned here, so the hot loop only
-        // ever sees an integer code.
-        c.data.push_back(v.type == AttrType::Tag ? intern_(c, v.text) : v.raw);
+        if (c.type == AttrType::Text) {
+            // Text's "value" is its term set, not a single code — see text_terms'
+            // doc comment. data[id] stays unused (0) so every column's arrays stay
+            // rows_-sized in lockstep, same as every other column here.
+            c.data.push_back(0);
+            c.raw_text.push_back(v.text);
+            uint32_t doc_len = 0;
+            c.text_terms.push_back(intern_terms_(c, v.text, doc_len));
+            c.doc_len.push_back(doc_len);
+        } else {
+            // Tag values arrive as strings and are interned here, so the hot loop
+            // only ever sees an integer code.
+            c.data.push_back(v.type == AttrType::Tag ? intern_(c, v.text) : v.raw);
+        }
         c.present.push_back(true);
     }
     payload_.push_back(rec.payload);
@@ -197,6 +264,11 @@ void MetadataStore::append_row_copy(InternalId src) {
     for (auto& c : columns_) {
         c.data.push_back(c.data[src]);
         c.present.push_back(c.present[src]);
+        if (c.type == AttrType::Text) {
+            c.text_terms.push_back(c.text_terms[src]);
+            c.doc_len.push_back(c.doc_len[src]);
+            c.raw_text.push_back(c.raw_text[src]);
+        }
     }
     payload_.push_back(payload_[src]);
     ++rows_;
@@ -215,9 +287,21 @@ void MetadataStore::set_row(InternalId id, const Record& rec) {
         if (rec.attrs.empty() || rec.attrs[a].is_null()) {
             c.data[id]    = 0;
             c.present[id] = false;
+            if (c.type == AttrType::Text) {
+                c.text_terms[id].clear();
+                c.doc_len[id] = 0;
+                c.raw_text[id].clear();
+            }
         } else {
             const AttrValue& v = rec.attrs[a];
-            c.data[id]    = (v.type == AttrType::Tag ? intern_(c, v.text) : v.raw);
+            if (c.type == AttrType::Text) {
+                c.raw_text[id] = v.text;
+                uint32_t doc_len = 0;
+                c.text_terms[id] = intern_terms_(c, v.text, doc_len);
+                c.doc_len[id]    = doc_len;
+            } else {
+                c.data[id] = (v.type == AttrType::Tag ? intern_(c, v.text) : v.raw);
+            }
             c.present[id] = true;
         }
         adjust_count_(a, id, /*increment=*/true);
@@ -235,22 +319,47 @@ void MetadataStore::permute(const std::vector<InternalId>& live) {
         std::vector<bool>     present;
         data.reserve(live.size());
         present.reserve(live.size());
+        std::vector<std::vector<uint32_t>> text_terms;
+        std::vector<uint32_t>              doc_len;
+        std::vector<std::string>           raw_text;
+        if (c.type == AttrType::Text) {
+            text_terms.reserve(live.size());
+            doc_len.reserve(live.size());
+            raw_text.reserve(live.size());
+        }
         for (InternalId src : live) {
             data.push_back(c.data[src]);
             present.push_back(c.present[src]);
+            if (c.type == AttrType::Text) {
+                text_terms.push_back(c.text_terms[src]);
+                doc_len.push_back(c.doc_len[src]);
+                raw_text.push_back(c.raw_text[src]);
+            }
         }
         c.data.swap(data);
         c.present.swap(present);
+        if (c.type == AttrType::Text) {
+            c.text_terms.swap(text_terms);
+            c.doc_len.swap(doc_len);
+            c.raw_text.swap(raw_text);
+        }
 
         // Postings are the one structure permute() doesn't just carry forward under
         // translation: compact() is exactly the point where the lazy stale/dead
         // entries postings() warns about get reclaimed, so rebuild each list fresh
-        // against the new numbering rather than remapping the old one.
+        // against the new numbering rather than remapping the old one. count/doc_freq
+        // needs no such rebuild — compact() only keeps rows that were already live,
+        // so a live-row *count* is unaffected by renumbering, only the id *lists* are.
         if (c.type == AttrType::Tag || c.type == AttrType::Bool) {
             for (auto& p : c.postings) p.clear();
             for (InternalId new_id = 0; new_id < c.present.size(); ++new_id)
                 if (c.present[new_id])
                     c.postings[static_cast<uint32_t>(c.data[new_id])].push_back(new_id);
+        } else if (c.type == AttrType::Text) {
+            for (auto& p : c.postings) p.clear();
+            for (InternalId new_id = 0; new_id < c.present.size(); ++new_id)
+                if (c.present[new_id])
+                    for (uint32_t code : c.text_terms[new_id]) c.postings[code].push_back(new_id);
         }
 
         // Same reason and same fresh-then-repopulate shape as postings just above:
@@ -277,6 +386,11 @@ void MetadataStore::clear_rows() {
     for (auto& c : columns_) {
         c.data.clear();
         c.present.clear();
+        if (c.type == AttrType::Text) {
+            c.text_terms.clear();
+            c.doc_len.clear();
+            c.raw_text.clear();
+        }
         // Dictionaries survive: codes already written into a snapshot must keep
         // meaning the same string. Counts reset to zero but keep dict-sized shape —
         // every code that existed still exists, it just has no live rows right now.
@@ -296,6 +410,7 @@ AttrValue MetadataStore::get(InternalId id, size_t attr) const {
         v.raw       = c.data[id];  // keep the code alongside the string
         return v;
     }
+    if (c.type == AttrType::Text) return attr_text(c.raw_text[id]);
     return AttrValue{c.type, c.data[id], {}};
 }
 
@@ -384,6 +499,13 @@ void MetadataStore::serialize(std::vector<uint8_t>& out) const {
         for (bool p : c.present) put<uint8_t>(out, p ? 1 : 0);
         put<uint64_t>(out, c.dict.size());
         for (const auto& s : c.dict) put_string(out, s);
+        // text_terms is not serialized here — it's derived from raw_text + dict
+        // above, same "derive, don't duplicate" choice count/postings/index already
+        // make. See deserialize().
+        if (c.type == AttrType::Text) {
+            put<uint64_t>(out, c.raw_text.size());
+            for (const auto& s : c.raw_text) put_string(out, s);
+        }
     }
     put<uint64_t>(out, payload_.size());
     for (const auto& p : payload_) put_bytes(out, p);
@@ -416,10 +538,30 @@ void MetadataStore::deserialize(Reader& r) {
             c.codes.emplace(c.dict[i], static_cast<uint32_t>(i));
         }
 
+        if (c.type == AttrType::Text) {
+            const uint64_t n_raw = r.get<uint64_t>();
+            c.raw_text.resize(n_raw);
+            for (uint64_t i = 0; i < n_raw; ++i) c.raw_text[i] = r.get_string();
+            // Rebuild text_terms by re-tokenizing against the dict just loaded above —
+            // deterministic tokenize_text() + intern_() reproduce exactly the codes
+            // this row was written with, since that dict was built from these same
+            // raw strings via the same tokenizer originally. See text_terms' doc
+            // comment on Column for why this isn't serialized directly.
+            c.text_terms.assign(n_raw, {});
+            c.doc_len.assign(n_raw, 0);
+            for (uint64_t i = 0; i < n_raw; ++i) {
+                if (!c.present[i]) continue;
+                uint32_t doc_len = 0;
+                c.text_terms[i] = intern_terms_(c, c.raw_text[i], doc_len);
+                c.doc_len[i]    = doc_len;
+            }
+        }
+
         // Counts and postings are derived, not serialized: sized here to match the
-        // loaded dictionary (Tag) / the fixed false-true pair (Bool), then filled by
-        // a rebuild_derived_state() pass once the caller knows which rows are live.
-        if (c.type == AttrType::Tag) {
+        // loaded dictionary (Tag/Text) / the fixed false-true pair (Bool), then
+        // filled by a rebuild_derived_state() pass once the caller knows which rows
+        // are live.
+        if (c.type == AttrType::Tag || c.type == AttrType::Text) {
             c.count.assign(c.dict.size(), 0);
             c.postings.assign(c.dict.size(), {});
         } else if (c.type == AttrType::Bool) {
