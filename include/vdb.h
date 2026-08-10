@@ -131,6 +131,17 @@ public:
     std::vector<ExternalId> search_auto(const float* query, size_t K, const Predicate& pred) const;
     std::vector<Hit> search_hits_auto(const float* query, size_t K, const Predicate& pred) const;
 
+    // BM25-ranked lexical search over Text column `attr` (Phase B, B4 —
+    // docs/plans/HYBRID_SEARCH_PLAN.md, kept local). Unlike every other Hit-
+    // returning method here, `Hit::dist` is a *score* — higher is better, and
+    // results come back sorted descending, not ascending. See
+    // MetadataStore::search_text's doc comment for the ranking details (tf
+    // recomputed per candidate, not stored; modern non-negative BM25 idf; query
+    // treated as a set of distinct terms). Throws std::invalid_argument if `attr`
+    // isn't a Text column.
+    std::vector<Hit> search_text(size_t attr, const std::string& query, size_t K, float k1 = 1.2f,
+                                 float b = 0.75f) const;
+
     // Rebuild the index from live vectors only, reclaiming tombstoned space.
     // External ids are preserved; internal ids are renumbered.
     void compact();

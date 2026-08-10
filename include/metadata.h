@@ -161,6 +161,14 @@ inline Predicate pred_range(size_t attr, AttrValue lo, AttrValue hi) {
 //                           needs a real estimator (histogram, sampling, or an
 //                           O(N) prepass), called out as separate, unbuilt work in
 //                           METADATA_DETAILS.md §4/§9, not invented here.
+// One scored match from MetadataStore::search_text() — a BM25-ranked lexical
+// result. `score` is higher-is-better (a similarity/relevance score), the opposite
+// sense of a vector search's distance — sorted descending, not ascending.
+struct TextMatch {
+    InternalId id;
+    float      score;
+};
+
 struct ResolvedPredicate {
     Predicate                              predicate;
     std::optional<std::vector<InternalId>> allowlist;
@@ -279,6 +287,16 @@ public:
         return c.present[id] ? c.doc_len[id] : 0;
     }
 
+    // Text only: column `attr`'s live document count and average document length —
+    // BM25's `N` and `avgdl`. Maintained incrementally alongside count[code] (same
+    // call sites: mark_live/mark_dead/set_row/rebuild_derived_state), not scanned
+    // per query. 0 if there are no live rows in this column.
+    size_t text_live_count(size_t attr) const { return columns_[attr].live_doc_count; }
+    double text_avg_doc_len(size_t attr) const {
+        const Column& c = columns_[attr];
+        return c.live_doc_count ? static_cast<double>(c.total_doc_len) / c.live_doc_count : 0.0;
+    }
+
     // Every *live* InternalId whose column `attr` holds a value in [lo, hi]
     // (inclusive), in ascending key order, via emit(id) — a callback rather than a
     // materialized vector for the same reason BPlusTree::range() is, one level
@@ -312,6 +330,36 @@ public:
     // or value/bound types don't match column `attr`'s declared type — the same
     // eager, described-mismatch philosophy validate() already uses for a Record.
     ResolvedPredicate resolve(const Predicate& pred, const std::vector<bool>& deleted) const;
+
+    // BM25-ranked search over Text column `attr` (Phase B, B4:
+    // docs/plans/HYBRID_SEARCH_PLAN.md, kept local). Tokenizes `query` with the same
+    // tokenize_text() documents were indexed with (a different tokenizer here would
+    // make terms silently fail to match) and treats it as a *set* of distinct terms
+    // — a repeated query word doesn't add extra weight, the common/simple form of
+    // Okapi BM25 rather than a query-term-frequency-weighted variant.
+    //
+    // Candidates are the union of every query term's postings, live-filtered against
+    // `deleted` (same reason resolve() takes it: MetadataStore has no notion of
+    // "live" on its own) — a document needs at least *one* query term present (OR
+    // semantics), not all of them, standard for ranked lexical search.
+    //
+    // Per-candidate term frequency (BM25's `tf`) isn't tracked persistently (B2 only
+    // stores presence and total length, not occurrence counts per (term, doc) pair
+    // — see HYBRID_SEARCH_PLAN.md's B4 note) — recomputed here by re-tokenizing each
+    // candidate's raw text once. That only touches documents postings already
+    // narrowed to, not the full corpus, the same cost shape pre-filter's brute-force
+    // scan already has over its own allowlist.
+    //
+    // idf uses the modern always-non-negative BM25 variant, ln(1 + (N-df+0.5)/(df+0.5))
+    // — the classic Robertson-Sparck-Jones form can go negative for a term present in
+    // over half the corpus, which would let a "common" term actively *hurt* a
+    // document's score instead of just contributing little.
+    //
+    // Returns the top `K` live documents by score, descending. Throws
+    // std::invalid_argument if `attr` isn't a Text column.
+    std::vector<TextMatch> search_text(size_t attr, const std::string& query, size_t K,
+                                       const std::vector<bool>& deleted, float k1 = 1.2f,
+                                       float b = 0.75f) const;
 
     void serialize(std::vector<uint8_t>& out) const;
     void deserialize(Reader& r);
@@ -356,6 +404,14 @@ private:
         // Same derive-don't-duplicate treatment as text_terms: not serialized,
         // recomputed by deserialize() alongside it.
         std::vector<uint32_t> doc_len;
+
+        // Text only. BM25's N and avgdl, maintained incrementally at the same call
+        // sites doc_freq (count[code]) already is (mark_live/mark_dead/set_row/
+        // rebuild_derived_state) rather than scanned per query. Like count[code],
+        // unaffected by permute(): compact() only keeps rows that were already
+        // live, so these totals don't change, only which InternalIds hold them.
+        size_t   live_doc_count = 0;  // live rows with a present value here
+        uint64_t total_doc_len  = 0;  // sum of doc_len over those rows
 
         // Text only. The original string, by InternalId, exactly as written —
         // tokenization is lossy (word order, casing, punctuation all gone), so this

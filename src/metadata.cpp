@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace vdb {
@@ -134,6 +136,13 @@ void MetadataStore::adjust_count_(size_t a, InternalId id, bool increment) {
             if (increment) ++c.count[code];
             else           --c.count[code];
         }
+        if (increment) {
+            ++c.live_doc_count;
+            c.total_doc_len += c.doc_len[id];
+        } else {
+            --c.live_doc_count;
+            c.total_doc_len -= c.doc_len[id];
+        }
         return;
     }
     if (c.type != AttrType::Tag && c.type != AttrType::Bool) return;
@@ -194,6 +203,10 @@ void MetadataStore::rebuild_derived_state(const std::vector<bool>& deleted) {
         if (c.type == AttrType::Tag || c.type == AttrType::Bool || c.type == AttrType::Text) {
             std::fill(c.count.begin(), c.count.end(), 0u);
             for (auto& p : c.postings) p.clear();
+        }
+        if (c.type == AttrType::Text) {
+            c.live_doc_count = 0;
+            c.total_doc_len  = 0;
         }
         // Fresh, empty tree rather than an O(k) walk removing every entry — same
         // "rebuild from scratch" call this function already makes for count/postings.
@@ -390,6 +403,8 @@ void MetadataStore::clear_rows() {
             c.text_terms.clear();
             c.doc_len.clear();
             c.raw_text.clear();
+            c.live_doc_count = 0;
+            c.total_doc_len  = 0;
         }
         // Dictionaries survive: codes already written into a snapshot must keep
         // meaning the same string. Counts reset to zero but keep dict-sized shape —
@@ -481,6 +496,80 @@ ResolvedPredicate MetadataStore::resolve(const Predicate& pred, const std::vecto
         range(pred.attr, pred.lo.as_double(), pred.hi.as_double(),
               [&](InternalId id) { ids.push_back(id); });
     out.allowlist = std::move(ids);
+    return out;
+}
+
+std::vector<TextMatch> MetadataStore::search_text(size_t attr, const std::string& query, size_t K,
+                                                   const std::vector<bool>& deleted, float k1,
+                                                   float b) const {
+    const Column& c = columns_[attr];
+    if (c.type != AttrType::Text)
+        throw std::invalid_argument("search_text on attribute '" + schema_[attr].name +
+                                    "': " + type_name(c.type) + " columns are not Text");
+
+    // Query terms as a set — see this method's doc comment for why repeats don't
+    // add extra weight.
+    std::vector<uint32_t> term_codes;
+    {
+        std::unordered_set<uint32_t> seen;
+        for (const std::string& tok : tokenize_text(query)) {
+            uint32_t code;
+            if (!tag_code(attr, tok, code)) continue;  // never indexed: matches nothing
+            if (seen.insert(code).second) term_codes.push_back(code);
+        }
+    }
+    if (term_codes.empty()) return {};
+
+    const double N     = static_cast<double>(text_live_count(attr));
+    const double avgdl = text_avg_doc_len(attr);
+    if (N == 0.0) return {};
+
+    // Each query term's idf and literal token string (the latter needed to count
+    // its occurrences per candidate below) computed once, not per candidate.
+    struct TermInfo {
+        std::string text;
+        double      idf;
+    };
+    std::vector<TermInfo> terms;
+    terms.reserve(term_codes.size());
+    for (uint32_t code : term_codes) {
+        const double df  = static_cast<double>(count(attr, code));
+        const double idf = std::log(1.0 + (N - df + 0.5) / (df + 0.5));
+        terms.push_back({c.dict[code], idf});
+    }
+
+    // Union of postings, live-filtered and de-duplicated — see this method's doc
+    // comment for the OR-semantics rationale.
+    std::unordered_set<InternalId> candidates;
+    for (uint32_t code : term_codes)
+        for (InternalId id : postings(attr, code))
+            if (id < deleted.size() && !deleted[id] && c.present[id]) candidates.insert(id);
+
+    std::vector<TextMatch> out;
+    out.reserve(candidates.size());
+    for (InternalId id : candidates) {
+        // tf per query term — one re-tokenization pass over this candidate only
+        // (see this method's doc comment for why tf isn't already stored).
+        std::unordered_map<std::string, uint32_t> tf;
+        for (const std::string& tok : tokenize_text(c.raw_text[id])) ++tf[tok];
+
+        const double doc_len = static_cast<double>(c.doc_len[id]);
+        const double norm    = k1 * (1.0 - b + b * (avgdl > 0.0 ? doc_len / avgdl : 0.0));
+
+        double score = 0.0;
+        for (const auto& t : terms) {
+            const auto it = tf.find(t.text);
+            if (it == tf.end()) continue;
+            const double f = static_cast<double>(it->second);
+            score += t.idf * (f * (k1 + 1.0)) / (f + norm);
+        }
+        out.push_back({id, static_cast<float>(score)});
+    }
+
+    const size_t take = std::min(K, out.size());
+    std::partial_sort(out.begin(), out.begin() + take, out.end(),
+                      [](const TextMatch& x, const TextMatch& y) { return x.score > y.score; });
+    out.resize(take);
     return out;
 }
 
